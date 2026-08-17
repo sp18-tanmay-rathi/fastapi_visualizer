@@ -876,71 +876,6 @@
   // where N = every node the branch has ever seen (nodesById.size) minus the
   // ones actually drawn from the chain (the stack-sourced ones; the root
   // itself isn't in nodesById so it doesn't count either way).
-  // Intern-friendly legend + one-line explainer, pinned bottom-left. Explains
-  // the whole picture in plain language: the single loop, the glyphs, the id.
-  function drawLegend() {
-    var rows = [
-      { c: "hsl(210,70%,50%)", box: true, t: "running on the event loop (this request is executing now)" },
-      { c: "hsl(210,80%,70%)", ring: true, t: "glowing ring = currently HOLDS the loop" },
-      { c: "hsl(210,30%,40%)", box: true, dim: true, t: "⏸ waiting at an await (paused, loop moved on)" },
-      { c: "hsl(30,90%,60%)", stub: true, t: "⇢ pool = blocking/sync work sent to a worker thread" },
-      { c: "#3fb950", check: true, t: "✓ finished = request completed (stays until you clear)" },
-      { c: "#8b949e", id: true, t: "#id = each request's unique id  ·  a row = one request" },
-    ];
-    var pad = 10, lh = 18, sw = 22;
-    var title = "One event loop, one thread — only ONE request runs at a time; the rest wait at an await.";
-    ctx.font = "11px monospace";
-    var boxW = 430;
-    var boxH = pad * 2 + 16 + rows.length * lh;
-    var x0 = 14;
-    var y0 = canvas.height - boxH - 14;
-
-    ctx.save();
-    ctx.globalAlpha = 0.92;
-    ctx.fillStyle = "#0d1117";
-    ctx.strokeStyle = "#30363d";
-    ctx.lineWidth = 1;
-    ctx.fillRect(x0, y0, boxW, boxH);
-    ctx.strokeRect(x0, y0, boxW, boxH);
-
-    ctx.fillStyle = "#e6edf3";
-    ctx.font = "bold 11px monospace";
-    ctx.textAlign = "left";
-    ctx.textBaseline = "top";
-    ctx.fillText(title, x0 + pad, y0 + pad);
-
-    var ty = y0 + pad + 18;
-    ctx.font = "11px monospace";
-    for (var i = 0; i < rows.length; i++) {
-      var r = rows[i];
-      var sx = x0 + pad;
-      var sy = ty + i * lh;
-      // swatch
-      ctx.fillStyle = r.c;
-      if (r.stub) {
-        ctx.strokeStyle = r.c;
-        ctx.setLineDash([3, 3]);
-        ctx.beginPath();
-        ctx.moveTo(sx, sy + 7);
-        ctx.lineTo(sx + sw, sy + 7);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      } else if (r.check || r.id) {
-        ctx.fillText(r.check ? "✓" : "#", sx + 4, sy);
-      } else {
-        ctx.fillRect(sx, sy + 1, 14, 12);
-        if (r.ring) {
-          ctx.strokeStyle = r.c;
-          ctx.lineWidth = 1.5;
-          ctx.strokeRect(sx - 2, sy - 1, 18, 16);
-        }
-      }
-      ctx.fillStyle = "#c9d1d9";
-      ctx.fillText(r.t, sx + sw + 6, sy);
-    }
-    ctx.textBaseline = "alphabetic";
-    ctx.restore();
-  }
 
   // Small "#id" tag above a request's root node so each concurrent request is
   // identifiable by its short random id (from the backend trace_id).
@@ -1178,7 +1113,6 @@
     }
 
     drawScrollbar(spine, layout.maxScroll, layout.contentHeight);
-    drawLegend();
     drawTooltip();
     requestAnimationFrame(render);
   }
@@ -1286,4 +1220,16 @@
       if (stepMode) doStep();
     });
   }
+
+  // Intern helper panel: minimize/expand by toggling the .min class; clicking
+  // anywhere on its header bar toggles too (the whole bar is the hit target).
+  var legendEl = document.getElementById("legend");
+  var legendHead = document.getElementById("legend-head");
+  var legendToggle = document.getElementById("legend-toggle");
+  function toggleLegend() {
+    if (!legendEl) return;
+    var min = legendEl.classList.toggle("min");
+    if (legendToggle) legendToggle.textContent = min ? "+" : "–";
+  }
+  if (legendHead) legendHead.addEventListener("click", toggleLegend);
 })();
