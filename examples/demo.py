@@ -4,10 +4,12 @@ Run with:
 
     uv run uvicorn examples.demo:app
 
-Then open http://127.0.0.1:8000/_viz in a browser and fire /async and /sync
-(e.g. with several concurrent curl/httpx requests) to watch call-tree
-branches sprout off the event loop hub, park at their await points, and the
-threadpool cluster fill up.
+Then open http://127.0.0.1:8000/_viz in a browser and drive some traffic:
+
+    uv run python examples/drive.py
+
+to watch call-tree branches sprout off the event-loop spine, park at their
+await points, and the sync endpoint run on the threadpool cluster.
 """
 
 import asyncio
