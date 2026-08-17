@@ -26,26 +26,15 @@ def app():
     return app
 
 
-async def _run_startup(app):
-    for handler in app.router.on_startup:
-        await handler()
-
-
-async def _run_shutdown(app):
-    for handler in app.router.on_shutdown:
-        await handler()
-
-
 async def test_call_tree_and_suspend_resume(app):
     collector.clear()
-    await _run_startup(app)
-    try:
+    # Drive the app's lifespan (visualize() installs the monitor by wrapping
+    # lifespan_context, which httpx.ASGITransport does not run on its own).
+    async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             responses = await asyncio.gather(*[client.get("/work") for _ in range(5)])
         assert all(r.status_code == 200 for r in responses)
-    finally:
-        await _run_shutdown(app)
 
     events = collector.snapshot()
     kinds = [e.kind for e in events]

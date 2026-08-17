@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -132,11 +133,33 @@ def visualize(app, roots: list[str] | None = None) -> None:
         except Exception:
             pass
 
-    # FastAPI/Starlette removed add_event_handler from the app itself in
-    # favor of lifespan context managers; the Router still exposes it for
-    # backward compatibility, which is what this relies on.
-    app.router.add_event_handler("startup", on_startup)
-    app.router.add_event_handler("shutdown", on_shutdown)
+    # Install by WRAPPING the router's lifespan_context, not via
+    # add_event_handler("startup"/"shutdown"). When the app is created with a
+    # custom `lifespan=` (as FastAPI(lifespan=...)), Starlette ignores the
+    # router's on_startup/on_shutdown handlers entirely — so relying on them
+    # silently skips monitor install for any app that uses a custom lifespan.
+    # Wrapping lifespan_context runs our setup/teardown around whatever the
+    # app already does, in every configuration.
+    try:
+        _prev_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def _viz_lifespan(app_):
+            await on_startup()
+            try:
+                async with _prev_lifespan(app_):
+                    yield
+            finally:
+                await on_shutdown()
+
+        app.router.lifespan_context = _viz_lifespan
+    except Exception:
+        # Fallback for older Starlette without a wrappable lifespan_context.
+        try:
+            app.router.add_event_handler("startup", on_startup)
+            app.router.add_event_handler("shutdown", on_shutdown)
+        except Exception:
+            pass
 
     try:
         _mount_dashboard(app)

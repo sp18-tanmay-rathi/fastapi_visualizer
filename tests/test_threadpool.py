@@ -23,20 +23,11 @@ def app():
     return app
 
 
-async def _run_startup(app):
-    for handler in app.router.on_startup:
-        await handler()
-
-
-async def _run_shutdown(app):
-    for handler in app.router.on_shutdown:
-        await handler()
-
-
 async def test_threadpool_saturation_is_sampled(app):
     collector.clear()
-    await _run_startup(app)
-    try:
+    # Drive the app's lifespan so visualize()'s startup (pool poller install)
+    # runs — httpx.ASGITransport does not run lifespan on its own.
+    async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             requests = [client.get("/work") for _ in range(10)]
@@ -45,8 +36,6 @@ async def test_threadpool_saturation_is_sampled(app):
             await asyncio.sleep(0.15)
             responses = await gather_task
         assert all(r.status_code == 200 for r in responses)
-    finally:
-        await _run_shutdown(app)
 
     events = collector.snapshot()
     pool_samples = [e for e in events if e.kind == "pool_sample"]
