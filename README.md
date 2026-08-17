@@ -8,11 +8,30 @@ threadpool — live, as a flow-graph, in your browser.
 ## Install
 
 Python 3.12+ (required — the instrumentation uses `sys.monitoring`, PEP 669,
-which landed in 3.12). Managed with [uv](https://docs.astral.sh/uv/):
+which landed in 3.12). Managed with [uv](https://docs.astral.sh/uv/).
+
+**Not on PyPI yet** — so `uv add` works, but point it at the local path (or
+git), not a bare name. A bare `uv add fastapi-visualizer` fails (nothing to
+resolve).
+
+**Recommended — path dependency** (persists across `uv sync`):
 
 ```bash
-uv add fastapi-visualizer
+cd your-project
+uv add --editable /Users/tanmayrathi/code-v2/fastapi_visualizer
 ```
+
+This writes it into your project's `pyproject.toml`, so `uv sync` / `uv
+remove` won't prune it. (A `uv pip install -e <path>` is *untracked* and gets
+pruned on the next sync — avoid it.) Drop `--editable` if you don't want live
+edits to the tool to flow through.
+
+Alternatives:
+
+- **From git** (once pushed):
+  `uv add "git+https://github.com/tanmayrathi-sp18/fastapi_visualizer"`
+- **PyPI** (only if/when published): then `uv add fastapi-visualizer` works
+  as-is.
 
 ## Quickstart
 
@@ -29,16 +48,21 @@ async def root():
 visualize(app)
 ```
 
-Run it and open the dashboard:
+Run your app as usual and open `http://127.0.0.1:8000/_viz`:
+
+```bash
+uv run uvicorn your_module:app --reload
+```
+
+To try the **bundled demo** instead, run it from *this* repo:
 
 ```bash
 uv run uvicorn examples.demo:app --reload
 ```
 
-then visit `http://127.0.0.1:8000/_viz`. The bundled `examples/demo.py` has
-an async endpoint (`/async`, a nested async call chain with real awaits) and
-a sync one (`/sync`, nested sync calls that Starlette offloads to the
-threadpool) to fire at.
+`examples/demo.py` has an async endpoint (`/async`, a nested async call chain
+with real awaits) and a sync one (`/sync`, nested sync calls that Starlette
+offloads to the threadpool) to fire at.
 
 By default `visualize(app, roots=None)` traces only the source directory of
 the module that called it (its own package directory is always excluded).
