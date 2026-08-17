@@ -18,7 +18,7 @@ resolve).
 
 ```bash
 cd your-project
-uv add --editable /path/fastapi_visualizer
+uv add --editable /Users/tanmayrathi/code-v2/fastapi_visualizer
 ```
 
 This writes it into your project's `pyproject.toml`, so `uv sync` / `uv
@@ -28,7 +28,7 @@ edits to the tool to flow through.
 
 Alternatives:
 
-- **From git** :
+- **From git** (once pushed):
   `uv add "git+https://github.com/tanmayrathi-sp18/fastapi_visualizer"`
 - **PyPI** (only if/when published): then `uv add fastapi-visualizer` works
   as-is.
@@ -45,7 +45,7 @@ app = FastAPI()
 async def root():
     return {"ok": True}
 
-visualize(app, root=["/path/to/root/of/app"])
+visualize(app)
 ```
 
 Run your app as usual and open `http://127.0.0.1:8000/_viz`:

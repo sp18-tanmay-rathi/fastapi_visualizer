@@ -42,6 +42,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Node hover tooltip shows qualname, `file:line`, and await state: "awaiting
   X" while a node is blocked on an await, "await complete: X" once it has
   resumed or returned.
+- Each request gets a short random id (6 hex chars), shown as a `#id` tag above
+  its row so concurrent requests are identifiable.
+- Intern-friendly legend + one-line explainer pinned bottom-left of the
+  dashboard (single-loop model + glyph meanings).
+
+### Fixed
+
+- Instrumentation now installs by wrapping the app's `lifespan_context`
+  instead of `add_event_handler("startup")`. Apps created with a custom
+  `lifespan=` (which makes Starlette ignore startup handlers) previously showed
+  only request start/end with no call tree; the monitor now installs in every
+  configuration.
 
 ### Changed
 

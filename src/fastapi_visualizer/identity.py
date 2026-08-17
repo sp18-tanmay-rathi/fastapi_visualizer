@@ -7,7 +7,7 @@ known to break contextvar propagation upward through the stack.
 from __future__ import annotations
 
 import asyncio
-import itertools
+import secrets
 import time
 from contextvars import ContextVar
 
@@ -16,11 +16,11 @@ from .events import Event, REQUEST_END, REQUEST_START
 
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id_var", default=None)
 
-_counter = itertools.count(1)
-
 
 def _next_trace_id() -> str:
-    return f"{next(_counter):08x}"
+    # Short random id per request (6 hex chars). Unique enough to tell
+    # concurrent requests apart in the dashboard; not a security token.
+    return secrets.token_hex(3)
 
 
 class TraceMiddleware:
