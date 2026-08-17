@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FastAPI Async Visualizer</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow: hidden;
+  }
+  header {
+    padding: 8px 14px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+  }
+  header h1 {
+    font-size: 15px;
+    margin: 0;
+    font-weight: 600;
+    color: #e6edf3;
+  }
+  #load {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #8b949e;
+  }
+  #load input {
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-family: monospace;
+    font-size: 12px;
+  }
+  #load input#ld-path { width: 90px; }
+  #load input#ld-count { width: 48px; }
+  #load input#ld-maxreq { width: 40px; }
+  #load button {
+    background: #238636;
+    color: #fff;
+    border: 0;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  #load button:hover { background: #2ea043; }
+  #load button:active { background: #1a6b2b; }
+  #load button:disabled {
+    background: #21262d;
+    color: #6e7681;
+    cursor: not-allowed;
+  }
+  #ld-note { color: #6e7681; }
+  #ld-speed-wrap { display: flex; align-items: center; gap: 6px; }
+  #ld-speed { width: 96px; }
+  #ld-speed-val { font-family: monospace; color: #c9d1d9; min-width: 44px; }
+  #ld-maxreq-wrap, #ld-step-wrap { display: flex; align-items: center; gap: 6px; }
+  #status {
+    font-size: 12px;
+    color: #8b949e;
+  }
+  #status .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 5px;
+    background: #f85149;
+  }
+  #status.connected .dot {
+    background: #3fb950;
+  }
+  #viz {
+    display: block;
+    width: 100vw;
+    height: calc(100vh - 37px);
+    background: #0d1117;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>FastAPI Async Visualizer</h1>
+  <div id="status"><span class="dot"></span><span id="status-text">disconnected</span> &middot; <span id="event-count">0</span> events</div>
+  <div id="load">
+    <label>load:</label>
+    <input id="ld-path" type="text" value="/async" title="path to request">
+    <input id="ld-count" type="number" value="10" min="1" max="500" title="concurrent requests">
+    <button id="ld-fire">fire</button>
+    <span id="ld-note"></span>
+    <span id="ld-speed-wrap">
+      <label for="ld-speed">speed:</label>
+      <input id="ld-speed" type="range" min="5" max="100" value="20" title="playback speed (slow-motion)">
+      <span id="ld-speed-val">0.20×</span>
+    </span>
+    <span id="ld-maxreq-wrap">
+      <label for="ld-maxreq">max req:</label>
+      <input id="ld-maxreq" type="number" value="10" min="1" max="50" title="max concurrent requests shown as rows">
+    </span>
+    <span id="ld-step-wrap">
+      <label for="ld-step"><input id="ld-step" type="checkbox"> step</label>
+      <button id="ld-step-btn" disabled title="apply buffered events until the loop hands off once">▶ step</button>
+    </span>
+    <button id="ld-clear" title="remove all requests currently shown (finished ones no longer disappear on their own)">clear</button>
+  </div>
+</header>
+<canvas id="viz"></canvas>
+<script src="./dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,268 @@
+"""sys.monitoring (PEP 669) instrumentation: global events, filename-scoped
+self-pruning, per-task call stacks that build a nested call tree.
+
+Monitoring is installed *globally* (not per-code) for PY_START, PY_RETURN,
+PY_UNWIND, PY_YIELD, PY_RESUME. Each callback checks code.co_filename against
+the configured project roots before doing anything else:
+
+  - not under any root (or under our own package dir)
+    -> return sys.monitoring.DISABLE. This permanently stops the interpreter
+       from calling back for that (tool, code, event) location, which is what
+       keeps stdlib/site-packages/venv code from costing anything after the
+       first call. (PY_UNWIND cannot be disabled this way — CPython raises if
+       you try — so that callback just no-ops on out-of-root code instead.)
+  - under a root but no active request (identity.current_trace() is None)
+    -> return None (stay enabled, emit nothing).
+  - under a root and inside a request -> record a call-tree event.
+
+Call-tree bookkeeping uses a per-task stack of node ids (task._viz_stack) plus
+a module-global monotonically increasing node id counter. When code runs
+off the event loop (e.g. offloaded to the threadpool by Starlette's sync-def
+handling), asyncio.current_task() is None; we fall back to a thread-local
+stack there. That is only correct because anyio's threadpool workers run one
+offloaded call at a time — it does not give a single stack across the
+sync/async boundary of one request (see threadpool.py for the related
+offload-attribution limitation).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import sys
+import threading
+import time
+from pathlib import Path
+
+from . import identity
+from .collector import collector
+from .events import CALL_ENTER, CALL_EXIT, Event, OFFLOAD_END, OFFLOAD_START, RESUME, SUSPEND
+
+m = sys.monitoring
+
+TOOL_NAME = "fastapi_visualizer"
+CO_COROUTINE = 0x80
+
+_PKG_DIR = str(Path(__file__).resolve().parent)
+
+_node_counter = itertools.count(1)
+_thread_local = threading.local()
+
+
+class Monitor:
+    def __init__(self, roots: list[str]) -> None:
+        self.roots = tuple(roots)
+        self.enabled = False
+        self.tool_id: int | None = None
+        self._offloaded: set[int] = set()
+
+    def _in_root(self, filename: str) -> bool:
+        if filename.startswith(_PKG_DIR):
+            return False
+        return filename.startswith(self.roots)
+
+    def install(self) -> None:
+        for i in range(6):
+            try:
+                m.use_tool_id(i, TOOL_NAME)
+                self.tool_id = i
+                break
+            except ValueError:
+                continue
+        else:
+            print(f"[{TOOL_NAME}] no free sys.monitoring tool id, disabling")
+            return
+
+        try:
+            m.register_callback(self.tool_id, m.events.PY_START, self._on_start)
+            m.register_callback(self.tool_id, m.events.PY_RETURN, self._on_return)
+            m.register_callback(self.tool_id, m.events.PY_UNWIND, self._on_unwind)
+            m.register_callback(self.tool_id, m.events.PY_YIELD, self._on_yield)
+            m.register_callback(self.tool_id, m.events.PY_RESUME, self._on_resume)
+            m.set_events(
+                self.tool_id,
+                m.events.PY_START
+                | m.events.PY_RETURN
+                | m.events.PY_UNWIND
+                | m.events.PY_YIELD
+                | m.events.PY_RESUME,
+            )
+        except Exception:
+            self.uninstall()
+            return
+
+        self.enabled = True
+
+    def uninstall(self) -> None:
+        if self.tool_id is None:
+            return
+        try:
+            m.set_events(self.tool_id, 0)
+        except Exception:
+            pass
+        for ev in (
+            m.events.PY_START,
+            m.events.PY_RETURN,
+            m.events.PY_UNWIND,
+            m.events.PY_YIELD,
+            m.events.PY_RESUME,
+        ):
+            try:
+                m.register_callback(self.tool_id, ev, None)
+            except Exception:
+                pass
+        try:
+            m.free_tool_id(self.tool_id)
+        except Exception:
+            pass
+        self._offloaded.clear()
+        self.tool_id = None
+        self.enabled = False
+
+    # -- per-task/per-thread call stack ---------------------------------
+
+    def _stack(self):
+        """Return (task, stack) for the currently executing call chain."""
+        try:
+            task = asyncio.current_task()
+        except Exception:
+            task = None
+        if task is not None:
+            stack = getattr(task, "_viz_stack", None)
+            if stack is None:
+                stack = []
+                try:
+                    task._viz_stack = stack
+                except Exception:
+                    pass
+            return task, stack
+        # Not running on an asyncio task: likely offloaded threadpool work.
+        stack = getattr(_thread_local, "stack", None)
+        if stack is None:
+            stack = []
+            _thread_local.stack = stack
+        return None, stack
+
+    def _push(self, kind: str, task, name: str, extra: dict) -> None:
+        try:
+            collector.push(
+                Event(
+                    t=time.monotonic(),
+                    kind=kind,
+                    trace_id=identity.current_trace(),
+                    task_id=id(task) if task is not None else None,
+                    name=name,
+                    extra=extra,
+                )
+            )
+        except Exception:
+            pass
+
+    # -- callbacks --------------------------------------------------------
+
+    def _on_start(self, code, instruction_offset):
+        try:
+            if not self._in_root(code.co_filename):
+                return m.DISABLE
+        except Exception:
+            return m.DISABLE
+        try:
+            if identity.current_trace() is None:
+                return
+            task, stack = self._stack()
+            parent_id = stack[-1] if stack else None
+            node_id = next(_node_counter)
+            stack.append(node_id)
+            is_async = bool(code.co_flags & CO_COROUTINE)
+            self._push(
+                CALL_ENTER,
+                task,
+                code.co_qualname,
+                {
+                    "node_id": node_id,
+                    "parent_id": parent_id,
+                    "qualname": code.co_qualname,
+                    "file": code.co_filename,
+                    "line": code.co_firstlineno,
+                    "is_async": is_async,
+                },
+            )
+            # Best-effort offload attribution (see threadpool.py): a sync def
+            # called with no caller on the stack is a request root running a
+            # plain `def` endpoint, which Starlette dispatches to the
+            # threadpool.
+            if parent_id is None and not is_async:
+                self._offloaded.add(node_id)
+                self._push(OFFLOAD_START, task, code.co_qualname, {"node_id": node_id})
+        except Exception:
+            pass
+
+    def _on_exit(self, code):
+        try:
+            if identity.current_trace() is None:
+                return
+            task, stack = self._stack()
+            if not stack:
+                return
+            node_id = stack.pop()
+            self._push(CALL_EXIT, task, code.co_qualname, {"node_id": node_id})
+            if node_id in self._offloaded:
+                self._offloaded.discard(node_id)
+                self._push(OFFLOAD_END, task, code.co_qualname, {"node_id": node_id})
+        except Exception:
+            pass
+
+    def _on_return(self, code, instruction_offset, retval):
+        try:
+            if not self._in_root(code.co_filename):
+                return m.DISABLE
+        except Exception:
+            return m.DISABLE
+        self._on_exit(code)
+
+    def _on_unwind(self, code, instruction_offset, exc):
+        # PY_UNWIND cannot be disabled via the DISABLE return value (raises
+        # ValueError if attempted), unlike the other events here — just skip
+        # bookkeeping for out-of-root code instead.
+        try:
+            if not self._in_root(code.co_filename):
+                return
+        except Exception:
+            return
+        self._on_exit(code)
+
+    def _on_yield(self, code, instruction_offset, retval):
+        try:
+            if not self._in_root(code.co_filename):
+                return m.DISABLE
+        except Exception:
+            return m.DISABLE
+        try:
+            if identity.current_trace() is None:
+                return
+            task, stack = self._stack()
+            if not stack:
+                return
+            node_id = stack[-1]
+            self._push(
+                SUSPEND, task, code.co_qualname, {"node_id": node_id, "awaiting": code.co_qualname}
+            )
+        except Exception:
+            pass
+
+    def _on_resume(self, code, instruction_offset):
+        try:
+            if not self._in_root(code.co_filename):
+                return m.DISABLE
+        except Exception:
+            return m.DISABLE
+        try:
+            if identity.current_trace() is None:
+                return
+            task, stack = self._stack()
+            if not stack:
+                return
+            node_id = stack[-1]
+            self._push(RESUME, task, code.co_qualname, {"node_id": node_id})
+        except Exception:
+            pass

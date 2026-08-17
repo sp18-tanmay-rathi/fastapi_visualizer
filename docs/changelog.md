@@ -1,0 +1,56 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+Format based on [Keep a Changelog](https://keepachangelog.com/).
+
+## [Unreleased]
+
+### Added
+
+- Initial uv project scaffold (fastapi, uvicorn, anyio; dev: pytest,
+  pytest-asyncio, httpx).
+- Docs: `architecture.md`, `plans/mvp.md`, `changelog.md`.
+- MVP: `sys.monitoring` event backbone with per-request await tracing; AnyIO
+  threadpool reader; Collector + WebSocket stream; canvas dashboard (lanes +
+  pool grid) mounted at `/_viz`; demo app; backbone + threadpool tests.
+- Dashboard load driver: fire N concurrent GETs at a path from the header bar
+  (self-demonstrating, no external tooling); idle hint when no lanes.
+- Slow-motion playback: header speed slider (0.05×–1.0×, default 0.2×). The
+  dashboard buffers events and replays them on a time-dilated virtual clock so
+  millisecond-fast request interleaving is watchable; idle gaps collapse,
+  backlog is capped, connect starts near live.
+- Vertical layout redesign: EVENT LOOP drawn as a vertical spine; each request
+  is a row branching rightward (call depth → x, siblings fan vertically). Row
+  count capped by a "max req" control (default 3) to keep it legible.
+- Step mode: pause auto-playback and click "▶ step" to advance exactly one loop
+  hand-off (suspend→resume to a different request) per click — makes the
+  single-thread "one runs, others parked at await" model explicit.
+- Backlog skip: the dashboard now ignores the on-connect snapshot and animates
+  only live post-connect events (stale traces were hogging the row slots).
+- Clarity at scale: each request collapses to its active call-path with a
+  "[+N]" badge (click a row to expand/collapse its full tree); rows keep a
+  fixed readable height and the canvas scrolls vertically when there are many.
+  Defaults raised to 10 requests.
+- Offload edge is now a short "⇢ pool" stub off the node instead of a
+  full-canvas diagonal to the threadpool box.
+- Finished requests persist (greyed, still expandable) instead of fading out;
+  a "clear" button wipes the view. "max req" now means "max rows kept" — at the
+  cap the oldest finished row is evicted to admit a new live one. Rows ordered
+  by arrival.
+- Finished request rows get a green "✓ finished" tag on the root node.
+- Node hover tooltip shows qualname, `file:line`, and await state: "awaiting
+  X" while a node is blocked on an await, "await complete: X" once it has
+  resumed or returned.
+
+### Changed
+
+- Threadpool poller emits `pool_sample` only on state change, so an idle app
+  produces no event traffic (counter reflects real activity, not a heartbeat).
+- **Visualization redesigned to a live flow-graph** (see
+  `docs/plans/graph-redesign.md`): central EVENT LOOP hub with one branch per
+  in-flight request = its full nested call tree. Node currently on the loop
+  glows; suspended branches park at their `await`; sync work routes to a
+  threadpool cluster. Backend event model reworked to a nested call tree
+  (`request_start/end`, `call_enter/exit`, `suspend/resume`, `offload_start/end`)
+  via global `sys.monitoring` scoped to project source by filename.
