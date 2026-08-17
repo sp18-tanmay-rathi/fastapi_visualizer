@@ -70,9 +70,9 @@ Pass `roots=[...]` to trace additional/different directories.
 
 ## Dashboard controls
 
-- **load path / count / fire** — fires N concurrent plain GETs at a path,
-  same-origin, no auth header — useful for self-demoing without external
-  tooling. Auth-protected routes need an external driver (curl/httpx/etc.).
+Drive traffic with your app as normal (real user actions, curl, httpx, a load
+tool) — the dashboard reflects whatever requests hit the app.
+
 - **speed** — slow-motion playback multiplier (0.05×–1.0×, default 0.2×),
   since real interleaving happens in milliseconds.
 - **max req** — max rows kept on screen (default 10, 1–50); at the cap the

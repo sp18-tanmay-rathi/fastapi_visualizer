@@ -717,7 +717,7 @@
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(
-      "nothing here — hit “fire” above to send traffic",
+      "no in-flight requests — send some traffic to your app to see them here",
       canvas.width / 2,
       canvas.height / 2
     );
@@ -1226,15 +1226,7 @@
   }
   connect();
 
-  // --- Load driver ---------------------------------------------------
-  // Fire N concurrent GETs at a path so the interleaving/pool saturation
-  // is demoable without external tooling. Same-origin: the visualized app
-  // serves this dashboard, so relative fetch() hits its own endpoints.
-  var fireBtn = document.getElementById("ld-fire");
-  var pathInput = document.getElementById("ld-path");
-  var countInput = document.getElementById("ld-count");
-  var noteEl = document.getElementById("ld-note");
-
+  // --- Controls ------------------------------------------------------
   // Speed slider: slider value 5..100 -> SPEED 0.05..1.0 (fraction of realtime).
   // Only relevant in continuous mode; step mode pauses the clock entirely.
   var speedInput = document.getElementById("ld-speed");
@@ -1292,28 +1284,6 @@
   if (stepBtn) {
     stepBtn.addEventListener("click", function () {
       if (stepMode) doStep();
-    });
-  }
-
-  if (fireBtn) {
-    fireBtn.addEventListener("click", function () {
-      var path = (pathInput.value || "/").trim();
-      var n = Math.max(1, Math.min(500, parseInt(countInput.value, 10) || 1));
-      noteEl.textContent = "firing " + n + " → " + path + " …";
-      var done = 0;
-      var failed = 0;
-      for (var i = 0; i < n; i++) {
-        fetch(path, { cache: "no-store" })
-          .then(function (r) { if (!r.ok) failed++; })
-          .catch(function () { failed++; })
-          .finally(function () {
-            done++;
-            if (done === n) {
-              noteEl.textContent =
-                "sent " + n + (failed ? " (" + failed + " failed)" : " ✓");
-            }
-          });
-      }
     });
   }
 })();

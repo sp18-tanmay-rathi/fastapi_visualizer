@@ -44,8 +44,6 @@
     font-family: monospace;
     font-size: 12px;
   }
-  #load input#ld-path { width: 90px; }
-  #load input#ld-count { width: 48px; }
   #load input#ld-maxreq { width: 40px; }
   #load button {
     background: #238636;
@@ -96,11 +94,6 @@
   <h1>FastAPI Async Visualizer</h1>
   <div id="status"><span class="dot"></span><span id="status-text">disconnected</span> &middot; <span id="event-count">0</span> events</div>
   <div id="load">
-    <label>load:</label>
-    <input id="ld-path" type="text" value="/async" title="path to request">
-    <input id="ld-count" type="number" value="10" min="1" max="500" title="concurrent requests">
-    <button id="ld-fire">fire</button>
-    <span id="ld-note"></span>
     <span id="ld-speed-wrap">
       <label for="ld-speed">speed:</label>
       <input id="ld-speed" type="range" min="5" max="100" value="20" title="playback speed (slow-motion)">
