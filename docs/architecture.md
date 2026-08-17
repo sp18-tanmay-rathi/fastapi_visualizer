@@ -42,23 +42,39 @@ threadpool), `asyncio.current_task()` is `None`, so the same bookkeeping falls
 back to a thread-local stack — correct only because AnyIO runs one offloaded
 call per worker thread at a time.
 
+**Async vs. offloaded classification.** `call_enter` carries two derived
+fields the frontend keys its two zones off of:
+
+- `is_async` tests `CO_COROUTINE | CO_ASYNC_GENERATOR` on the code object, so
+  both `async def` **and** `async def … yield` (async-generator dependencies
+  like FastAPI's `get_db`) count as async. Testing `CO_COROUTINE` alone — the
+  earlier bug — wrongly read async generators as sync.
+- `execution` is `"threadpool"` when the frame runs with **no current asyncio
+  task** (an AnyIO worker thread — the real offload signal), else
+  `"event_loop"`. Only a worker-thread request root emits
+  `offload_start`/`offload_end`. This replaced an earlier heuristic
+  (`parent_id is None and not is_async`) that misfired on loop-run async
+  generators.
+
 ### Event kinds
 
 | kind | extra fields | meaning |
 |---|---|---|
 | `request_start` | `{method, path}` | a request began; branch root created for its trace_id |
 | `request_end` | `{}` | the request finished |
-| `call_enter` | `{node_id, parent_id, qualname, file, line, is_async}` | entered a function frame (a graph node) |
+| `call_enter` | `{node_id, parent_id, qualname, file, line, is_async, execution}` | entered a function frame (a graph node); `execution` = `"event_loop"` or `"threadpool"` |
 | `call_exit` | `{node_id}` | that frame returned or unwound |
 | `suspend` | `{node_id, awaiting}` | frame hit an `await` and yielded the loop |
 | `resume` | `{node_id}` | frame resumed on the loop |
-| `offload_start` | `{node_id}` | a sync request-root call started running on the threadpool |
+| `offload_start` | `{node_id}` | a worker-thread (offloaded sync) call started |
 | `offload_end` | `{node_id}` | that offloaded call returned |
 | `pool_sample` | `{borrowed, total, queued}` | threadpool occupancy (emitted only on change) |
 
-`Event` is `{t, kind, trace_id, task_id, name, extra}` (`events.py`), with
+`Event` is `{seq, t, kind, trace_id, task_id, name, extra}` (`events.py`), with
 `to_dict()` for JSON. `node_id` is a global monotonically increasing int
-assigned at `call_enter` and matched by `call_exit`.
+assigned at `call_enter` and matched by `call_exit`. `seq` is a process-wide
+monotonic counter assigned authoritatively in `Collector.push()` — the client
+detects dropped events by watching for gaps in it (see Data flow).
 
 ### Identity
 
@@ -76,9 +92,9 @@ contextvar.
 `threadpool.py` polls AnyIO's default thread `CapacityLimiter` (`borrowed`/
 `total`/`queued`) every 50ms and pushes a `pool_sample` event only when the
 tuple changes, so an idle app produces no event traffic. Per-request offload
-attribution is emitted by `monitor.py`, not here: a sync (non-async) frame
-with no parent on the stack is a request root running a plain `def`
-endpoint, which Starlette dispatches to the threadpool — that frame's
+attribution is emitted by `monitor.py`, not here: a request-root frame that
+runs with **no current asyncio task** is executing on an AnyIO worker thread
+(a sync `def` endpoint Starlette dispatched to the threadpool) — that frame's
 `call_enter`/`call_exit` also fire `offload_start`/`offload_end`. This is
 necessarily **best-effort** (see Known limitations).
 
@@ -97,11 +113,15 @@ necessarily **best-effort** (see Known limitations).
 ## Data flow
 
 Instrumentation (monitoring callbacks + limiter poll) pushes `Event` objects
-into the **Collector**, a bounded ring buffer (`deque(maxlen=5000)`) that fans
-each event out to subscriber queues. The `/_viz/ws` WebSocket handler
+into the **Collector**, a bounded ring buffer (`deque(maxlen=5000)`) that
+stamps each event with a monotonic `seq` and fans it out to subscriber queues
+(each bounded; oldest dropped on overflow). The `/_viz/ws` WebSocket handler
 batches whatever is on its queue into a frame roughly every 33ms (~30fps) and
 sends it to the browser; on connect it first sends a one-time backlog
-snapshot of everything currently in the ring buffer.
+snapshot of everything currently in the ring buffer. Because the buffers are
+bounded, a busy app can shed events — the client watches `seq` for gaps and
+surfaces a "N events dropped" banner rather than silently reconstructing an
+impossible tree.
 
 ```
         ┌──────────────────────── your FastAPI app ─────────────────────────┐
@@ -122,7 +142,7 @@ reqs →  │  event loop (1 thread)          AnyIO threadpool (≤40 tokens)   
 ### WS frame contract
 
 ```json
-{"events": [{"t": 0.0, "kind": "...", "trace_id": "...", "task_id": 0, "name": "...", "extra": {}}]}
+{"events": [{"seq": 1, "t": 0.0, "kind": "...", "trace_id": "...", "task_id": 0, "name": "...", "extra": {}}]}
 ```
 
 `kind` is one of the nine values in the table above.
@@ -130,58 +150,68 @@ reqs →  │  event loop (1 thread)          AnyIO threadpool (≤40 tokens)   
 ## Frontend: the flow graph
 
 Single `<canvas>`, vanilla JS, no build step, no external dependencies —
-works fully offline (`static/dashboard.js`).
+works fully offline (`static/dashboard.js`). It is **view-only**: it never
+issues requests to the app; traffic is driven externally (curl, httpx,
+`examples/drive.py`, real users).
 
-- **Spine**: the event loop is drawn as a vertical bar ("EVENT LOOP (1
-  thread)") on the left edge. Each displayed request is a **row** stacked
-  down the spine; a row's call tree flows rightward from its root node
-  (depth → x, sibling calls fan vertically within the row).
-- **Loop holder**: derived client-side from the event stream, not measured
-  directly — the single-loop rule is "the trace that most recently
-  entered/resumed a frame and hasn't since suspended holds the loop." It is
-  shown three ways: a bright, thick connector from that row to the spine, a
-  glowing marker on the spine at that row's height, and a glow ring around
-  the active node itself.
-- **Suspended nodes** are dimmed, tagged with a ⏸ glyph, and connect to their
-  parent with a faint dashed edge ("parked" — the loop moved on).
-- **Offloaded nodes** (sync work on the threadpool) draw a short dashed "⇢
-  pool" stub instead of parking. A **THREADPOOL** cluster box pinned
-  bottom-right shows `borrowed/total` as a filled grid of cells.
-- **Collapsed by default**: a row shows only its active call-path chain (root
-  → the frame currently running/awaiting), with a "[+N]" badge summarizing
-  everything else; click anywhere on a row to expand/collapse its full tree.
-- **Variable-height rows**, stacked in arrival order (not a fixed slot per
-  request), with vertical mouse-wheel scroll and a scrollbar when the stack
-  overflows the viewport.
+- **Two zones.** The canvas splits into a top **EVENT LOOP** zone (async
+  requests — root frame `execution == "event_loop"`) and a bottom
+  **THREADPOOL** zone (sync/offloaded requests — `execution == "threadpool"`).
+  Each zone has its own vertical spine, header, row stack, and scroll; the
+  divider sits proportionally to each zone's row count. This teaches the real
+  distinction: on the loop only one request runs at a time, on the threadpool
+  several worker threads run genuinely in parallel. A branch defaults to the
+  loop zone until its request-root `call_enter` classifies it.
+- **Rows.** Each displayed request is a row; its call tree flows rightward
+  from the root node (depth → x, siblings fan vertically within the row).
+- **Runtime state** (per row, shown as a tag next to the `#id`): `RUNNING`
+  (executing now), `WAITING` (parked at an `await`), `UNTRACED` (loop holder
+  is off in code outside the roots — see below), `DONE` (finished).
+- **Loop holder** (EVENT LOOP zone only): derived client-side, not a measured
+  event — "the async trace that most recently entered/resumed a frame and
+  hasn't since suspended." Shown as a bright thick connector to the spine, a
+  glowing spine marker, and a glow ring on the active node. **Threadpool rows
+  never set or steal the holder** — sync work isn't on the loop. When the
+  holder has produced no in-root event for a short interval (playback time),
+  its state flips to `UNTRACED` and the spine marker dims to a hollow "loop:
+  untraced" instead of a confident glow.
+- **Suspended nodes** are dimmed, tagged ⏸, and connect to their parent with a
+  faint dashed edge ("parked").
+- **Threadpool zone**: the whole zone means "on a worker thread", so the
+  per-node "⇢ pool" stub is suppressed there; the worker-token grid
+  (`borrowed/total`, filled cells) lives in the zone header.
+- **Collapsed by default**: a row shows only its active call-path chain with a
+  "[+N]" badge for the rest; click a row to expand/collapse its full tree.
+- **Variable-height rows**, stacked in arrival order, with per-zone
+  mouse-wheel scroll and a scrollbar when a zone's stack overflows its band.
 - **Slow-motion playback**: incoming events are buffered and replayed against
   a virtual clock advancing at `SPEED × real time` (header speed slider,
-  0.05×–1.0×, default 0.2×) so millisecond-fast interleaving is watchable.
-  The one-time backlog snapshot sent on connect is intentionally skipped —
-  only live post-connect events animate.
-- **Step mode**: the header "step" checkbox pauses the virtual clock; each
-  "▶ step" click drains buffered events until the loop hands off to a
-  different (non-null) holder — one control transfer per click.
-- **Persistence**: finished requests stay on screen (greyed "done" node
-  styling, root node tagged green "✓ finished") instead of fading out. A
-  "clear" button wipes every displayed/hidden branch. "max req" (default 10,
-  1–50) is the cap on rows *kept*; at the cap, the oldest **finished** row is
-  evicted to admit a new live trace — if every kept row is still live, the
-  new trace is hidden instead.
-- **Tooltip** on node hover: qualname, `file:line`, and — while the node has
-  an await recorded — "awaiting X" if still blocked or "await complete: X"
-  once it has resumed or returned.
-- **Header controls**: `load path` + `count` + `fire` (fires plain GETs,
-  same-origin, no auth — a JWT-protected route needs an external driver),
-  `speed` slider, `max req`, `step` toggle + `▶ step`, `clear`.
+  0.05×–1.0×, default 0.2×). The one-time backlog snapshot on connect is
+  skipped — only live post-connect events animate.
+- **Step mode**: the "step" checkbox pauses the virtual clock; each "▶ step"
+  click drains buffered events until the loop hands off to a different holder.
+- **Persistence**: finished requests stay (greyed "done" styling, root tagged
+  green "✓ finished") instead of fading. "clear" wipes everything. "max req"
+  (default 10, 1–50) caps rows *kept*; at the cap the oldest **finished** row
+  is evicted, else a new trace is hidden.
+- **Dropped-event banner**: if the stream's `seq` skips (server shed events
+  under load), the header shows "⚠ N events dropped — some traces may be
+  incomplete".
+- **Tooltip** on node hover: qualname, `file:line`, and await state ("awaiting
+  X" / "await complete: X").
+- **Header controls**: `speed` slider, `max req`, `step` toggle + `▶ step`,
+  `clear`. (No load/fire control — the dashboard is view-only.)
 
 ## Derived vs. measured
 
 Every event in the WS frame (`call_enter`, `suspend`, `pool_sample`, …) is a
 **measured** fact from `sys.monitoring` or the limiter poll. "Who holds the
-loop" is not one of those events — it is **derived** client-side from the
-measured stream by the single-loop rule above, which is exact as long as the
-app has only one event loop thread (true for a standard FastAPI/uvicorn
-process).
+loop" is not one of those events — it is **derived** client-side by the
+single-loop rule above, exact as long as the app has one event-loop thread
+(true for a standard FastAPI/uvicorn process). Crucially the UI now marks the
+gap in that derivation: between two measured in-root events the loop may be in
+untraced library code, so a stalled holder is shown as `UNTRACED` rather than
+implying its last frame is still executing.
 
 ## Fail-soft
 
@@ -197,8 +227,12 @@ disables tracing (no leaked callbacks or DISABLE state).
 - **Only the app's own source is traced** (`roots`, default: the directory of
   the module that called `visualize()`). Time spent inside stdlib,
   site-packages, or the event loop's own internals produces no events, so
-  between two measured events the loop-holder highlight is blind — it holds
-  on the last known holder (or reads idle) until the next in-root event.
+  between two measured events the loop-holder derivation is blind. This is now
+  **surfaced rather than hidden**: a holder that goes quiet flips to the
+  `UNTRACED` state instead of implying it's still running.
+- **Bounded buffers can drop events under load** (ring 5000, per-subscriber
+  queue 1000). Dropping is no longer silent — `seq` gaps drive a client
+  banner — but a trace spanning a drop may still render incompletely.
 - The loop-holder highlight tracks **playback position** (the slow-motion
   virtual clock), not wall-clock time.
 - **Threadpool offload attribution is best-effort**: `sys.monitoring`

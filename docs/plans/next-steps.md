@@ -24,6 +24,9 @@ Tag `v0.1.0` only when ALL of these hold:
 - custom-lifespan apps work (already fixed; covered by a test in task 1);
 - a monitoring failure cannot break the application (fail-soft; test in task 1);
 - `roots` scoping works (test in task 1);
+- child-task trace propagation is tested (task 1);
+- events carry monotonic sequence numbers and event loss is detectable (task 15);
+- loop state distinguishes running / waiting / untraced / done (task 4);
 - the visualizer is disabled by default outside debug mode (task 7);
 - the multi-worker limitation is clearly surfaced (task 9);
 - `uv run pytest` passes and CI passes on 3.12/3.13/3.14 (tasks 1, 13A);
@@ -36,20 +39,32 @@ PyPI publishing (13B) is explicitly NOT part of v0.1.0 — see Phase 5.
 ## Execution roadmap (phases)
 
 - **Phase 1 — Correctness (make the existing system trustworthy):**
-  6 → 1 → 5 → 4
+  6 → 1 → 15 → 5 → 4
 - **Phase 2 — Teaching feature:** 3
 - **Phase 3 — Safety (safe to hand to another dev):** 7 (incl. former 8) → 9 → 12
 - **Phase 4 — Adoptable + release:** 13A → 2
 - **Phase 5 — Perf / config / polish (only after the model is proven):**
-  10 → 11 → 14 → 13B
+  10 → 11 → 14 → 17 → 18 → 19 → 13B
 
 Rationale: task 6 is a real classification bug AND a prerequisite for task 5's
 zone split, so it's first. Tests (1) come immediately after so every later
-change lands on a safety net. Task 5 is treated as **conceptual correctness**
-(it changes the mental model the tool teaches), not UI polish. Task 4 gets much
-simpler once 5 removes sync work from the loop-holder logic. Sampling/config
-(10/11) wait until benchmarks show a real problem — filename-scoped monitoring
-with `DISABLE` already trims most overhead, so don't optimize blind.
+change lands on a safety net. Task 15 (sequence numbers) lands in Phase 1 too:
+building more UI on a stream that can silently drop structural events
+(`call_enter` without `call_exit`) reconstructs impossible state — make loss
+detectable before trusting the model. Task 5 is treated as **conceptual
+correctness** (it changes the mental model the tool teaches), not UI polish.
+Task 4 gets much simpler once 5 removes sync work from the loop-holder logic,
+and it now also formalizes explicit runtime states (RUNNING / WAITING /
+UNTRACED / DONE) so the UI never looks more certain than the instrumentation
+is. Sampling/config (10/11) wait until benchmarks show a real problem —
+filename-scoped monitoring with `DISABLE` already trims most overhead, so don't
+optimize blind.
+
+> **Doc provenance:** this file is the single source of truth. It absorbed an
+> external review (correctness-first spine, seq numbers, explicit states,
+> status_code, inspector, child-task branches, module split, replay tests,
+> benchmark matrix, per-app collector); that separate review doc has since been
+> removed.
 
 ---
 
@@ -105,6 +120,9 @@ work so those land on a net. Cover exactly the fragile areas:
   `resume` or `call_exit` for the same node_id.
 - **roots scoping:** a file outside `roots` produces no `call_enter`; one
   inside does.
+- **child-task trace propagation:** an endpoint that `asyncio.create_task()`s
+  child work — assert children inherit the request `trace_id` (task factory)
+  yet keep independent `task_id` / stacks (guards task 17's rendering).
 
 Files: `tests/` (new cases + shared fixture helper). Timing-robust assertions
 (counts ≥ thresholds, not exact).
@@ -185,6 +203,37 @@ Files: `static/dashboard.js`, `static/index.html`, `docs/architecture.md`
 **Done-check:** a request awaiting a real DB/network call (untraced client lib)
 shows the spine as "untraced" during the wait, not as a bright holder; back to
 bright when in-root code runs.
+
+**Formalize runtime state (from the fix-plan review):** don't derive the loop
+holder ad-hoc from "most recent event". Give each request an explicit state —
+`RUNNING` / `WAITING` / `UNTRACED` / `DONE` (add `UNKNOWN` if needed) — and
+render that. `UNTRACED` is exactly the blind-spot case above: last in-root event
+handed control outside `roots` and no new in-root event has re-established
+position. This makes measured state visually distinct from inferred state; the
+README must state the distinction. Tests cover the transitions.
+
+## 15. Event sequence numbers + drop visibility — Phase 1 reliability
+
+`Collector` uses bounded buffers (ring 5000, per-subscriber queue 1000) and
+**silently drops oldest on overflow**. A dropped structural event corrupts the
+stream — e.g. `call_enter(42)` dropped but `call_exit(42)` delivered, or
+`suspend(17)` dropped before `resume(17)` — and the frontend reconstructs an
+impossible state with no signal that anything is wrong. Fix before stacking more
+UI on the model.
+
+- **Backend:** add a process-wide monotonic `seq: int` to `Event`, assigned
+  centrally in `Collector.push()` (single authoritative ordering). Keep the
+  producer path non-blocking; never wait on a slow browser subscriber. Track a
+  per-subscriber dropped-event counter. Optionally surface it in the WebSocket
+  frame envelope: `{events, first_seq, last_seq, dropped_before}`.
+- **Frontend:** track the last received `seq`; if the next frame's `first_seq`
+  skips ahead (or `dropped_before > 0`), mark the stream gapped and show a
+  non-invasive banner: "⚠ N events dropped — this trace may be incomplete."
+  Prefer degrading gracefully over asserting a reconstructed-but-wrong tree.
+
+Files: `events.py`, `collector.py`, `app.py`, `static/dashboard.js`, tests.
+**Done-check:** every emitted event has an increasing `seq`; a forced overflow
+is detected client-side and banners; a test asserts monotonic ordering.
 
 ---
 
@@ -323,6 +372,11 @@ Don't build before measuring — filename-scoped monitoring with
 `sys.monitoring.DISABLE` already trims out-of-root overhead. After Phase 1–3,
 benchmark; only if overhead is real:
 
+- **Benchmark matrix first (§25):** because `sys.monitoring` hooks run in the
+  interpreter, measure before adding callbacks. Compare (1) no visualizer,
+  (2) installed-but-disabled, (3) enabled + roots scoping, (4) enabled +
+  dashboard connected, (5) under concurrent load. Track rps, p50/p95/p99
+  latency, CPU, memory, events/sec. Don't optimize on intuition.
 - **Self-overhead:** cheap running counter of time in monitoring callbacks;
   surface an approximate "tracing overhead" figure in the header.
 - **Sampling:** `sample=` (default 1.0). Decide at `request_start`, tag the
@@ -330,7 +384,7 @@ benchmark; only if overhead is real:
 
 Files: `identity.py`, `monitor.py`, `app.py`, `static/*`.
 **Done-check:** `sample=0.1` traces ~10%; header shows a non-zero overhead
-figure under load.
+figure under load; benchmark numbers recorded before/after.
 
 ## 11. Config surface (split: core lands with earlier tasks, rest here)
 
@@ -346,15 +400,73 @@ Files: `app.py`, `monitor.py`, `README.md`.
 
 ## 14. Feature polish (nice-to-have)
 
-- Status code + duration on the ✓ finished tag (needs `request_end.extra =
-  {status, duration_ms}` from the middleware).
-- Filter/search rows by path substring.
+- **Request duration:** derive `wall = request_end.t - request_start.t`
+  (timestamps already monotonic). Show next to each request; flag/color slow
+  ones over a configurable threshold. Frontend-derived first; add a semantic
+  `RequestTrace` model only if request-level features grow.
+- **Status code:** `TraceMiddleware` emits method/path but not status. Wrap the
+  ASGI `send` to observe `http.response.start` and record `status_code` WITHOUT
+  buffering the body; stamp `request_end.extra = {status, duration_ms}`.
+- **Request inspector panel:** click a request row → method, path, trace id,
+  task id, start/end, duration, status, exception state, #call nodes,
+  #suspensions, #blocking events, execution zone. Turns raw events into a
+  readable latency/exec profile.
+- **Stronger request id (§11):** `_next_trace_id()` uses `secrets.token_hex(3)`
+  (6 hex) — fine for the demo, weak under load. Widen to `token_hex(8)` (or
+  UUID) internally; keep the short display in the UI. Optional: correlate with
+  an inbound `X-Request-ID` header when present (don't replace the generated id
+  unless configured).
+- Filter/search rows: `path:/checkout`, `status:500`, `slow:true`,
+  `zone:threadpool`. Keep it simple substring/keyword — no query language yet.
 - Hover a qualname → highlight it across all requests.
 - Optional `X-Request-ID` response header carrying the trace id (default off).
 
 Files: `identity.py`, `static/*`.
-**Done-check:** finished tag shows `200 · 42ms`; filter box hides non-matching
-rows.
+**Done-check:** finished tag shows `200 · 42ms`; inspector opens on row click;
+filter box hides non-matching rows.
+
+## 17. Child tasks as separate branches of one trace
+
+`identity.py` already propagates `trace_id` to child tasks and resets their
+stacks — right direction, but the frontend can render two concurrent
+`asyncio.create_task()` branches as one linear chain, which is wrong. Make the
+model explicit: one request (`trace_id`) contains N execution branches keyed by
+`task_id`, each with its own call tree. Include `task_id` in request-tree state;
+render concurrent children as parallel branches under the same request. Guarded
+by the child-task test in task 1.
+
+Files: `static/dashboard.js`, `static/index.html`.
+**Done-check:** a request spawning two concurrent child tasks renders as one
+request with two concurrent branches, not a single call chain.
+
+## 18. Split `dashboard.js` into modules (maintainability)
+
+`dashboard.js` now does WebSocket, buffering, playback clock, trace state, tree
+reconstruction, layout, canvas rendering, interaction, threadpool rendering, and
+UI controls in one file. Keep vanilla JS (no-build / offline requirement), but
+separate concerns into ES modules loaded by `index.html`:
+`static/dashboard/{websocket,events,state,layout,renderer,main}.js`. A build
+step stays optional; the goal is maintainability, and it's a prerequisite for
+task 19's pure reducer tests.
+
+Files: `static/*`.
+**Done-check:** dashboard still works offline; state/reducer logic is importable
+in isolation.
+
+## 19. Deterministic frontend event-replay tests
+
+Once task 18 makes the reducer pure, feed it fixed event sequences and assert
+resulting state — no browser needed. Example fixture
+(`request_start, call_enter A, call_enter B, suspend B, resume B, call_exit B,
+call_exit A, request_end`) → one request, correct parent/child, B suspended then
+resumed, A root, request finished. Also cover: seq gaps (task 15), multiple
+tasks under one trace (task 17), offload events, blocking warnings (task 3), and
+out-of-order / duplicate events rejected safely. Browser automation can come
+later.
+
+Files: `static/dashboard/*`, a small JS test harness.
+**Done-check:** the reducer produces expected state for each fixture; a gap
+fixture flips the dropped-events flag.
 
 ## 13B. PyPI publishing (post-v0.1.0, separate cycle)
 
@@ -374,3 +486,11 @@ publish only after another project has used the tagged git version.
   `threadpool.py` limitation).
 - Historical scrub / replay of a past run.
 - VS Code extension delivery.
+- **Per-app collector (§16):** the module-level `collector = Collector()`
+  singleton means every visualized app in one process shares one stream.
+  Supported model for now = one visualized app per process (document it). A
+  per-app `Collector` on `app.state._viz` is a larger refactor — only after the
+  core event model is stable.
+- OpenTelemetry mapping, multi-worker aggregation, external-dependency tracing
+  (HTTP/DB/Redis), Chrome Trace export — all premature until the event model is
+  proven. Layer on after v0.1.x.

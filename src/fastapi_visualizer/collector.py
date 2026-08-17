@@ -15,6 +15,7 @@ class Collector:
     def __init__(self) -> None:
         self.buffer: deque[Event] = deque(maxlen=BUFFER_MAXLEN)
         self._subscribers: set[asyncio.Queue] = set()
+        self._seq = 0
 
     @property
     def events(self) -> deque[Event]:
@@ -24,6 +25,11 @@ class Collector:
         return list(self.buffer)
 
     def push(self, event: Event) -> None:
+        # Single authoritative ordering: every emitted event gets the next seq,
+        # so a gap on the client side unambiguously means events were dropped
+        # (by the bounded ring here or a full subscriber queue below).
+        self._seq += 1
+        event.seq = self._seq
         self.buffer.append(event)
         for q in list(self._subscribers):
             try:
@@ -48,6 +54,7 @@ class Collector:
     def clear(self) -> None:
         self.buffer.clear()
         self._subscribers.clear()
+        self._seq = 0
 
 
 collector = Collector()

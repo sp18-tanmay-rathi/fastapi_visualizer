@@ -41,7 +41,14 @@ from .events import CALL_ENTER, CALL_EXIT, Event, OFFLOAD_END, OFFLOAD_START, RE
 m = sys.monitoring
 
 TOOL_NAME = "fastapi_visualizer"
+# CPython code-object flags (Include/cpython/code.h). A coroutine is
+# `async def`; an async generator is `async def ... yield`. BOTH run on the
+# event loop and must classify as async — testing only CO_COROUTINE wrongly
+# reads an async-generator dependency (e.g. FastAPI's `async def get_db: yield`)
+# as sync and offloads it. CO_ASYNC = the mask covering both.
 CO_COROUTINE = 0x80
+CO_ASYNC_GENERATOR = 0x200
+CO_ASYNC = CO_COROUTINE | CO_ASYNC_GENERATOR
 
 _PKG_DIR = str(Path(__file__).resolve().parent)
 
@@ -173,7 +180,15 @@ class Monitor:
             parent_id = stack[-1] if stack else None
             node_id = next(_node_counter)
             stack.append(node_id)
-            is_async = bool(code.co_flags & CO_COROUTINE)
+            is_async = bool(code.co_flags & CO_ASYNC)
+            # True threadpool signal: code running with NO current asyncio task
+            # is on an anyio worker thread (that's exactly where _stack() falls
+            # back to the thread-local stack). This replaces the old
+            # `parent_id is None and not is_async` guess, which misfired on
+            # loop-run async generators. Async work always has a current task,
+            # so it can never be mislabeled as offloaded now.
+            is_worker = task is None
+            execution = "threadpool" if is_worker else "event_loop"
             self._push(
                 CALL_ENTER,
                 task,
@@ -185,13 +200,13 @@ class Monitor:
                     "file": code.co_filename,
                     "line": code.co_firstlineno,
                     "is_async": is_async,
+                    "execution": execution,
                 },
             )
-            # Best-effort offload attribution (see threadpool.py): a sync def
-            # called with no caller on the stack is a request root running a
-            # plain `def` endpoint, which Starlette dispatches to the
-            # threadpool.
-            if parent_id is None and not is_async:
+            # Mark the ROOT frame of a worker-thread call chain as offloaded
+            # (parent_id None = top of this thread's stack), wrapping the whole
+            # offloaded subtree in one offload_start/offload_end pair.
+            if is_worker and parent_id is None:
                 self._offloaded.add(node_id)
                 self._push(OFFLOAD_START, task, code.co_qualname, {"node_id": node_id})
         except Exception:

@@ -44,8 +44,6 @@
   var SIBLING_GAP = 40; // baseline px between sibling slots within a row band
   var MARGIN = 20; // right-edge margin reserved so trees don't run off-canvas
   var SPINE_X = 70; // x of the vertical event-loop spine
-  var SPINE_TOP = 56; // y where the spine begins (below its label block)
-  var SPINE_BOTTOM_MARGIN = 20; // gap from spine bottom to canvas bottom
   var ROOT_X = SPINE_X + 90; // x where each row's request-root node sits
   var ROW_BAND_FILL = 0.8; // fraction of a row's band height siblings may use
   var MIN_SCALE = 0.35;
@@ -56,13 +54,53 @@
   var ROW_EXPANDED_MAX_FRAC = 0.6; // ...nor taller than this fraction of the viewport
   var ROW_GAP = 8; // breathing room between stacked rows
 
+  // Two-zone layout (task 5): the canvas splits into a top EVENT LOOP zone
+  // (async requests, one-runs-at-a-time) and a bottom THREADPOOL zone (sync
+  // offloaded requests, real parallelism). Each zone has its own spine,
+  // header, row stack and scroll. The divider sits proportionally to how many
+  // rows each zone holds, clamped so both headers always stay visible.
+  var ZONE_TOP = 8; // top margin above the loop zone
+  var ZONE_BOTTOM_MARGIN = 8; // bottom margin below the pool zone
+  var ZONE_HEADER_H = 46; // header strip (label + counts / pool grid) per zone
+  var ZONE_DIV_GAP = 7; // half-gap around the divider line
+  var ZONE_MIN_FRAC = 0.26; // neither zone shrinks below this fraction
+  var ZONE_MAX_FRAC = 0.74;
+
+  // Loop-holder honesty (task 4): if the holder produced no in-root event for
+  // this many SERVER seconds (playback time), the loop is presumed to be
+  // running untraced code (stdlib / a DB driver / an HTTP client) rather than
+  // the last in-root frame — so we show it dimmed as "untraced" instead of a
+  // confident bright glow.
+  var UNTRACED_AFTER = 0.15;
+
   var canvas = document.getElementById("viz");
   var ctx = canvas.getContext("2d");
   var statusEl = document.getElementById("status");
   var statusTextEl = document.getElementById("status-text");
   var eventCountEl = document.getElementById("event-count");
+  var dropWarnEl = document.getElementById("drop-warn");
+  var dropCountEl = document.getElementById("drop-count");
 
   var eventCount = 0;
+
+  // --- Dropped-event detection (see events.py/collector.py seq) ---------
+  // Every event carries a process-wide monotonic `seq`. In RECEIPT order the
+  // seq should increase by exactly 1; a larger jump means the bounded server
+  // buffer shed events in between, so the trace we're reconstructing may be
+  // missing structural events (a call_enter without its call_exit, etc.).
+  // Surface that instead of silently drawing an impossible state.
+  var lastSeq = null; // last seq seen in receipt order (null until first live event)
+  var droppedCount = 0;
+
+  function noteSeq(seq) {
+    if (typeof seq !== "number") return;
+    if (lastSeq !== null && seq > lastSeq + 1) {
+      droppedCount += seq - lastSeq - 1;
+      if (dropCountEl) dropCountEl.textContent = String(droppedCount);
+      if (dropWarnEl) dropWarnEl.hidden = false;
+    }
+    if (lastSeq === null || seq > lastSeq) lastSeq = seq;
+  }
 
   // --- Time tracking -------------------------------------------------
   // Event timestamps (`t`) come from the server's monotonic clock, which
@@ -128,6 +166,11 @@
 
   // Latest threadpool sample.
   var pool = { borrowed: 0, total: POOL_DEFAULT_TOTAL, queued: 0 };
+
+  // Set true while drawing rows in the THREADPOOL zone: the whole zone already
+  // means "on a worker thread", so the per-node "⇢ pool" stub is redundant
+  // noise there and is suppressed.
+  var poolZoneDraw = false;
 
   // --- Request cap / MAX ROWS KEPT -------------------------------------
   // Only up to MAX_REQ requests are ever KEPT on screen at once (header
@@ -276,6 +319,13 @@
       done: false,
       doneAt: 0,
       expanded: false,
+      // "loop" (async, runs on the event loop) until the request-root frame's
+      // call_enter proves it's "pool" (sync, offloaded to a worker thread).
+      // Determines which zone the row lives in (task 5).
+      zone: "loop",
+      // Server-time of the most recent in-root event for this trace; used to
+      // decide when a loop holder has gone "untraced" (task 4).
+      lastEventT: 0,
     };
     b.rootNode = {
       id: "root:" + traceId,
@@ -336,6 +386,13 @@
       if (ev.kind === "call_enter") {
         var b2 = getOrCreateBranch(traceId);
         if (!b2) continue;
+        b2.lastEventT = ev.t;
+        // Classify the row's zone from its request-root frame (parent_id null):
+        // the backend stamps execution = "threadpool" when the frame runs on a
+        // worker thread (sync def), "event_loop" otherwise (async).
+        if (extra.parent_id == null && extra.execution) {
+          b2.zone = extra.execution === "threadpool" ? "pool" : "loop";
+        }
         var parent =
           extra.parent_id == null
             ? b2.rootNode
@@ -354,14 +411,18 @@
         b2.nodesById.set(extra.node_id, node);
         parent.children.push(node);
         b2.stack.push(extra.node_id);
-        // Entering a frame means this trace is actively running on the loop.
-        loopHolder = traceId;
+        // Entering a frame means this trace is actively running — but only a
+        // LOOP-zone request can hold the single event loop. Pool-zone (sync,
+        // worker-thread) work runs in parallel and must never claim/steal the
+        // loop holder (task 4/5 correctness).
+        if (b2.zone === "loop") loopHolder = traceId;
         continue;
       }
 
       if (ev.kind === "call_exit") {
         var b3 = branches.get(traceId);
         if (!b3) continue;
+        b3.lastEventT = ev.t;
         var n3 = b3.nodesById.get(extra.node_id);
         if (n3) {
           n3.state = "done";
@@ -375,6 +436,7 @@
       if (ev.kind === "suspend") {
         var b4 = branches.get(traceId);
         if (!b4) continue;
+        b4.lastEventT = ev.t;
         var n4 = b4.nodesById.get(extra.node_id);
         if (n4) {
           n4.state = "suspended";
@@ -391,12 +453,13 @@
       if (ev.kind === "resume") {
         var b5 = branches.get(traceId);
         if (!b5) continue;
+        b5.lastEventT = ev.t;
         var n5 = b5.nodesById.get(extra.node_id);
         if (n5) {
           n5.state = "running";
           if (n5.awaiting) n5.awaitDone = true; // the await it was blocked on resolved
         }
-        loopHolder = traceId;
+        if (b5.zone === "loop") loopHolder = traceId;
         continue;
       }
 
@@ -475,18 +538,20 @@
     mouseY = -1;
   });
 
-  // --- Vertical scroll (rows can outgrow the viewport once expanded, or once
-  // there are ~10 of them) --------------------------------------------------
-  // scrollY is in CONTENT space (0 = top row flush with the spine label).
-  // render()/layoutRows() clamps it to [0, contentHeight - canvas.height]
-  // every frame (content can shrink as branches finish, so re-clamping only
-  // on wheel input isn't enough). Row screen positions are simply
-  // contentY - scrollY; see layoutRows().
-  var scrollY = 0;
+  // --- Vertical scroll (per zone) -----------------------------------------
+  // Each zone (loop / pool) has its own scroll offset in CONTENT space (0 =
+  // its first row flush under its spine top). drawZone() clamps it every frame
+  // to [0, contentHeight - bandRowsH] (content can shrink as branches finish)
+  // and converts content positions to screen ones. The wheel scrolls whichever
+  // zone the cursor is over (dividerY is recomputed every frame in render()).
+  var scrollLoop = 0;
+  var scrollPool = 0;
+  var dividerY = 0;
   canvas.addEventListener(
     "wheel",
     function (e) {
-      scrollY += e.deltaY;
+      if (mouseY >= 0 && mouseY > dividerY) scrollPool += e.deltaY;
+      else scrollLoop += e.deltaY;
       e.preventDefault();
     },
     { passive: false }
@@ -514,13 +579,6 @@
     }
   });
 
-  // The vertical spine's extent, recomputed every frame from canvas size.
-  function spineGeometry() {
-    var top = SPINE_TOP;
-    var bottom = Math.max(top + 40, canvas.height - SPINE_BOTTOM_MARGIN);
-    return { x: SPINE_X, top: top, bottom: bottom };
-  }
-
   // Full-tree metrics (leaf count, max depth) for an EXPANDED branch. Reuses
   // assignPositions, which also stamps node._depth/_x used later by the
   // actual draw walk — safe to compute once per frame and hand the numbers
@@ -544,18 +602,17 @@
   // then converts each row's content-space top/center into the screen-space
   // numbers everything else (drawing, hit-testing, the marker on the spine)
   // uses.
-  function layoutRows() {
-    var order = [];
-    branches.forEach(function (b) {
-      order.push(b);
-    });
+  // Lay out ONE zone's branch list in content space (top = 0). The caller
+  // (drawZone) offsets by the zone's spine-top and scroll to get screen space.
+  function layoutRowList(list) {
+    var order = list.slice();
     order.sort(function (a, b) {
       return a.seq - b.seq;
     });
 
     var metrics = new Map(); // traceId -> {leafCount, maxDepth}, expanded rows only
     var rows = [];
-    var y = SPINE_TOP; // content-space cursor; SPINE_TOP is the "top offset below the spine label"
+    var y = 0;
     for (var i = 0; i < order.length; i++) {
       var b = order[i];
       var h;
@@ -571,31 +628,44 @@
       rows.push({ branch: b, contentTop: y, height: h, contentCenter: y + h / 2 });
       y += h + ROW_GAP;
     }
-    var contentHeight = y + SPINE_BOTTOM_MARGIN; // + bottom padding
+    return { rows: rows, metrics: metrics, contentHeight: y };
+  }
 
-    // Clamp scroll to what's actually scrollable; content can shrink (a
-    // branch finishes/collapses) so this has to happen every frame, not just
-    // on wheel input.
-    var maxScroll = Math.max(0, contentHeight - canvas.height);
-    scrollY = Math.max(0, Math.min(scrollY, maxScroll));
-
-    for (var j = 0; j < rows.length; j++) {
-      rows[j].screenTop = rows[j].contentTop - scrollY;
-      rows[j].screenCenter = rows[j].contentCenter - scrollY;
+  // --- Runtime state (task 4) --------------------------------------------
+  // Measured state per request, distinguishing what the instrumentation can
+  // actually see from what it's merely inferring:
+  //   RUNNING  - loop zone: currently holds the loop and produced an in-root
+  //              event recently; pool zone: a worker frame is executing.
+  //   WAITING  - parked at an await (loop) / not yet on a worker (pool).
+  //   UNTRACED - held the loop but has produced no in-root event for
+  //              UNTRACED_AFTER seconds: the loop is running code outside the
+  //              configured roots (stdlib / DB driver / HTTP client), so we
+  //              can't claim this frame is the one running.
+  //   DONE     - request_end seen.
+  function activeNodeId(b) {
+    return b.stack.length ? b.stack[b.stack.length - 1] : null;
+  }
+  function branchState(b) {
+    if (b.done) return "DONE";
+    if (b.zone === "pool") return b.stack.length ? "RUNNING" : "WAITING";
+    if (loopHolder === b.traceId) {
+      if (virtualT !== null && b.lastEventT && virtualT - b.lastEventT > UNTRACED_AFTER) {
+        return "UNTRACED";
+      }
+      return "RUNNING";
     }
-
-    return { rows: rows, metrics: metrics, contentHeight: contentHeight, maxScroll: maxScroll };
+    return "WAITING";
   }
 
   // Thin scrollbar on the right edge, only drawn when the row stack overflows
   // the viewport. Track spans the spine's visible extent; thumb size/position
   // mirror scrollY/maxScroll the same way a native scrollbar would.
-  function drawScrollbar(spine, maxScroll, contentHeight) {
+  function drawScrollbar(spine, maxScroll, contentHeight, scrollVal) {
     if (maxScroll <= 0) return;
     var trackTop = spine.top;
     var trackH = spine.bottom - spine.top;
-    var thumbH = Math.max(24, trackH * (canvas.height / contentHeight));
-    var thumbY = trackTop + (scrollY / maxScroll) * (trackH - thumbH);
+    var thumbH = Math.max(24, trackH * (trackH / contentHeight));
+    var thumbY = trackTop + (scrollVal / maxScroll) * (trackH - thumbH);
     var x = canvas.width - 6;
     ctx.fillStyle = "#21262d";
     ctx.fillRect(x, trackTop, 4, trackH);
@@ -603,56 +673,23 @@
     ctx.fillRect(x, thumbY, 4, thumbH);
   }
 
-  function poolRect() {
-    var w = 168;
-    var h = 118;
-    // Bottom-right, out of the way of the row bands which grow rightward
-    // from the spine on the left.
-    return { x: canvas.width - w - 16, y: canvas.height - h - 16, w: w, h: h };
-  }
-
-  function drawThreadpool() {
-    var r = poolRect();
+  // The worker-token grid (borrowed/total). Drawn as a compact single-row
+  // strip inside the THREADPOOL zone header (see drawZoneHeader), so the pool
+  // saturation reads right beside the sync rows it explains.
+  function drawPoolGrid(rect) {
     var total = pool.total || POOL_DEFAULT_TOTAL;
     var borrowed = pool.borrowed || 0;
     var saturated = borrowed >= total && total > 0;
-
-    ctx.fillStyle = "#161b22";
-    ctx.strokeStyle = "#30363d";
-    ctx.lineWidth = 1;
-    ctx.fillRect(r.x, r.y, r.w, r.h);
-    ctx.strokeRect(r.x, r.y, r.w, r.h);
-
-    ctx.fillStyle = saturated ? "#f85149" : "#8b949e";
-    ctx.font = "11px monospace";
-    ctx.textBaseline = "top";
-    ctx.textAlign = "left";
-    ctx.fillText(
-      "THREADPOOL " + borrowed + "/" + total,
-      r.x + 8,
-      r.y + 6
-    );
-
-    var padding = 8;
-    var gridTop = r.y + 24;
-    var gridW = r.w - padding * 2;
-    var gridH = r.h - 24 - padding;
-    var cols = Math.min(total, 10) || 1;
-    var rows = Math.ceil(total / cols) || 1;
-    var gap = 3;
-    var cellW = (gridW - gap * (cols - 1)) / cols;
-    var cellH = (gridH - gap * (rows - 1)) / rows;
-    var cellSize = Math.max(3, Math.min(cellW, cellH));
-
+    var gap = 2;
+    var n = Math.max(1, total);
+    var cellSize = Math.max(3, Math.min(10, (rect.w - gap * (n - 1)) / n));
+    var y = rect.y + (rect.h - cellSize) / 2;
     for (var i = 0; i < total; i++) {
-      var col = i % cols;
-      var row = Math.floor(i / cols);
-      var x = r.x + padding + col * (cellSize + gap);
-      var y = gridTop + row * (cellSize + gap);
+      var x = rect.x + i * (cellSize + gap);
+      if (x + cellSize > rect.x + rect.w) break; // don't overflow the strip
       ctx.fillStyle = i < borrowed ? (saturated ? "#f85149" : "#3fb950") : "#21262d";
       ctx.fillRect(x, y, cellSize, cellSize);
     }
-    return r;
   }
 
   // Draw the event-loop spine: the vertical bar itself, its label block, and
@@ -662,7 +699,50 @@
   // comes from the holder's already-scrolled row position, so it stays next
   // to the right row even when that row has scrolled — and is skipped
   // entirely if the row has scrolled out of view.
-  function drawSpine(spine, rows, liveCount, totalCount) {
+  // Header strip at the top of a zone: title + counts (loop) or title + the
+  // worker-token grid (pool). Drawn in plain screen space, above the spine.
+  function drawZoneHeader(zone, band, list) {
+    var liveCount = 0;
+    for (var i = 0; i < list.length; i++) if (!list[i].done) liveCount++;
+
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    var ty = band.top + ZONE_HEADER_H / 2 - 6;
+    ctx.fillStyle = "#e6edf3";
+    ctx.font = "bold 12px monospace";
+    if (zone === "loop") {
+      ctx.fillText("EVENT LOOP", 12, ty);
+      ctx.font = "10px monospace";
+      ctx.fillStyle = "#8b949e";
+      ctx.fillText(
+        "1 thread · one runs at a time · " + liveCount + " live · " + list.length + " shown",
+        12,
+        ty + 14
+      );
+    } else {
+      var total = pool.total || POOL_DEFAULT_TOTAL;
+      var borrowed = pool.borrowed || 0;
+      var saturated = borrowed >= total && total > 0;
+      ctx.fillText("THREADPOOL", 12, ty);
+      ctx.font = "10px monospace";
+      ctx.fillStyle = saturated ? "#f85149" : "#8b949e";
+      ctx.fillText(
+        "worker threads · run in parallel · " + borrowed + "/" + total + " busy",
+        12,
+        ty + 14
+      );
+      // token grid, right-aligned in the header
+      var gw = Math.min(220, canvas.width * 0.3);
+      drawPoolGrid({ x: canvas.width - gw - 16, y: band.top + 8, w: gw, h: ZONE_HEADER_H - 16 });
+    }
+    ctx.textBaseline = "alphabetic";
+  }
+
+  // The zone's vertical spine + (loop zone only) the holder marker next to the
+  // running row. A holder that has gone UNTRACED shows a dim hollow marker
+  // instead of the bright glow — the loop is off in library code, and we say
+  // so rather than implying this frame is still executing (task 4).
+  function drawZoneSpine(zone, spine, rows) {
     ctx.save();
     ctx.strokeStyle = "#484f58";
     ctx.lineWidth = 3;
@@ -672,43 +752,57 @@
     ctx.stroke();
     ctx.restore();
 
-    ctx.textAlign = "center";
-    ctx.textBaseline = "alphabetic";
-    ctx.fillStyle = "#e6edf3";
-    ctx.font = "bold 12px monospace";
-    ctx.fillText("EVENT LOOP", spine.x, 18);
-    ctx.font = "10px monospace";
-    ctx.fillStyle = "#8b949e";
-    ctx.fillText("(1 thread)", spine.x, 32);
-    // liveCount = still in-flight, totalCount = every kept row (done ones
-    // persist until evicted/cleared — see the "clear" button + row cap).
-    ctx.fillText(liveCount + " live · " + totalCount + " shown", spine.x, 46);
-
-    if (loopHolder) {
-      var hb = branches.get(loopHolder);
-      var holderRow = null;
-      for (var i = 0; i < rows.length; i++) {
-        if (rows[i].branch.traceId === loopHolder) {
-          holderRow = rows[i];
-          break;
-        }
-      }
-      if (hb && holderRow) {
-        var y = holderRow.screenCenter;
-        if (y >= spine.top - 10 && y <= spine.bottom + 10) {
-          ctx.save();
-          ctx.shadowColor = "hsl(" + hb.hue + ", 90%, 65%)";
-          ctx.shadowBlur = 16;
-          ctx.fillStyle = "hsl(" + hb.hue + ", 90%, 60%)";
-          ctx.beginPath();
-          ctx.arc(spine.x, y, 7, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.restore();
-        }
+    if (zone !== "loop" || !loopHolder) return;
+    var hb = branches.get(loopHolder);
+    if (!hb || hb.zone !== "loop") return;
+    var holderRow = null;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].branch.traceId === loopHolder) {
+        holderRow = rows[i];
+        break;
       }
     }
+    if (!holderRow) return;
+    var y = holderRow.screenCenter;
+    if (y < spine.top - 10 || y > spine.bottom + 10) return;
 
-    ctx.textAlign = "left";
+    var state = branchState(hb);
+    if (state === "UNTRACED") {
+      ctx.save();
+      ctx.strokeStyle = "#8b949e";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(spine.x, y, 6, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = "#8b949e";
+      ctx.font = "9px monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText("loop: untraced", spine.x + 12, y);
+      ctx.restore();
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+    } else {
+      ctx.save();
+      ctx.shadowColor = "hsl(" + hb.hue + ", 90%, 65%)";
+      ctx.shadowBlur = 16;
+      ctx.fillStyle = "hsl(" + hb.hue + ", 90%, 60%)";
+      ctx.beginPath();
+      ctx.arc(spine.x, y, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawDivider(y) {
+    ctx.save();
+    ctx.strokeStyle = "#30363d";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(canvas.width, y);
+    ctx.stroke();
+    ctx.restore();
   }
 
   function drawIdleHint() {
@@ -819,7 +913,7 @@
     // WORKER THREAD, not the event loop. Draw a SHORT dashed stub off the
     // node's right side with a "⇢ pool" tag (a full-canvas line to the fixed
     // corner box read as a glitch); the pinned THREADPOOL box shows the count.
-    if (node.offloaded) {
+    if (node.offloaded && !poolZoneDraw) {
       var sx = x + w / 2;
       var sy = y;
       var stub = 26 * scale;
@@ -879,19 +973,34 @@
 
   // Small "#id" tag above a request's root node so each concurrent request is
   // identifiable by its short random id (from the backend trace_id).
-  function drawRequestId(b, rowY) {
+  var STATE_STYLE = {
+    RUNNING: { glyph: "●", color: "#3fb950", label: "RUNNING" },
+    WAITING: { glyph: "○", color: "#8b949e", label: "WAITING" },
+    UNTRACED: { glyph: "⋯", color: "#d29922", label: "UNTRACED" },
+    DONE: { glyph: "✓", color: "#6e7681", label: "DONE" },
+  };
+
+  function drawRowHeader(b, state, rowY) {
     ctx.save();
-    ctx.fillStyle = "hsl(" + b.hue + ", 60%, 72%)";
-    ctx.font = "bold 11px monospace";
-    ctx.textAlign = "left";
+    var y = rowY - NODE_H / 2 - 4;
     ctx.textBaseline = "bottom";
-    ctx.fillText("#" + b.traceId, ROOT_X - NODE_W / 2, rowY - NODE_H / 2 - 4);
     ctx.textAlign = "left";
+    ctx.font = "bold 11px monospace";
+    ctx.fillStyle = "hsl(" + b.hue + ", 60%, 72%)";
+    var idText = "#" + b.traceId;
+    ctx.fillText(idText, ROOT_X - NODE_W / 2, y);
+    var idW = ctx.measureText(idText).width;
+
+    var st = STATE_STYLE[state] || STATE_STYLE.WAITING;
+    ctx.font = "10px monospace";
+    ctx.fillStyle = st.color;
+    ctx.fillText(st.glyph + " " + st.label, ROOT_X - NODE_W / 2 + idW + 10, y);
+
     ctx.textBaseline = "alphabetic";
     ctx.restore();
   }
 
-  function drawBranchCollapsed(b, spine, rowY, pRect, alpha) {
+  function drawBranchCollapsed(b, spine, rowY, alpha, activeId, holds) {
     var chain = [b.rootNode];
     for (var i = 0; i < b.stack.length; i++) {
       var n = b.nodesById.get(b.stack[i]);
@@ -902,7 +1011,6 @@
     var scaleX = maxDepth > 0 ? Math.min(1, availW / (maxDepth * NODE_SPACING_X)) : 1;
     var scale = Math.max(MIN_SCALE, scaleX);
 
-    var activeId = loopHolder === b.traceId ? b.stack[b.stack.length - 1] : null;
     var prevX = spine.x;
     var lastX = ROOT_X;
 
@@ -912,7 +1020,6 @@
       var edgeColor = "hsl(" + b.hue + ", 60%, 50%)";
 
       if (node.isRoot) {
-        var holds = loopHolder === b.traceId;
         drawEdge(
           spine.x,
           rowY,
@@ -933,7 +1040,7 @@
         drawEdge(prevX, rowY, x, rowY, edgeColor, edgeAlpha, dashed, 1.5);
       }
 
-      drawNode(node, x, rowY, NODE_W * scale, NODE_H * scale, scale, alpha, b.hue, activeId, pRect);
+      drawNode(node, x, rowY, NODE_W * scale, NODE_H * scale, scale, alpha, b.hue, activeId, null);
       prevX = x;
       lastX = x;
     }
@@ -962,7 +1069,7 @@
   // max depth fits the available width and its sibling spread fits the row's
   // OWN height; most rows still draw at scale 1 since row height is sized to
   // the tree in layoutRows().
-  function drawBranchExpanded(b, spine, rowY, rowHeight, pRect, alpha, metrics) {
+  function drawBranchExpanded(b, spine, rowY, rowHeight, alpha, metrics, activeId, holds) {
     var leafCount = metrics.leafCount;
     var maxDepth = metrics.maxDepth;
 
@@ -972,7 +1079,6 @@
     var scaleY = Math.min(1, (rowHeight * ROW_BAND_FILL) / Math.max(1, neededH));
     var scale = Math.max(MIN_SCALE, Math.min(1, scaleX, scaleY));
 
-    var activeId = loopHolder === b.traceId ? b.stack[b.stack.length - 1] : null;
     var rootPos = null;
 
     function pos(node) {
@@ -990,8 +1096,7 @@
 
       if (node.isRoot) {
         // Connector from the request root to the spine: bright + thick while
-        // this row holds the loop, faint + dashed while it's parked.
-        var holds = loopHolder === b.traceId;
+        // this row is running, faint + dashed while it's parked.
         drawEdge(
           spine.x,
           rowY,
@@ -1022,7 +1127,7 @@
         alpha,
         b.hue,
         activeId,
-        pRect
+        null
       );
 
       for (var i = 0; i < node.children.length; i++) {
@@ -1067,52 +1172,115 @@
     }
   }
 
+  // Draw one zone: its header, spine, and row stack (clipped to the zone's
+  // band, scrolled by its own offset). Returns the laid-out rows (for the
+  // shared click/hover hit-test) and the clamped scroll offset.
+  function drawZone(zone, band, list, scrollVal) {
+    var spineTop = band.top + ZONE_HEADER_H;
+    var spineBottom = Math.max(spineTop + 20, band.bottom);
+    var bandRowsH = spineBottom - spineTop;
+
+    var layout = layoutRowList(list);
+    var maxScroll = Math.max(0, layout.contentHeight - bandRowsH);
+    var s = Math.max(0, Math.min(scrollVal, maxScroll));
+
+    for (var i = 0; i < layout.rows.length; i++) {
+      layout.rows[i].screenTop = spineTop + layout.rows[i].contentTop - s;
+      layout.rows[i].screenCenter = spineTop + layout.rows[i].contentCenter - s;
+    }
+
+    drawZoneHeader(zone, band, list);
+    var spine = { x: SPINE_X, top: spineTop, bottom: spineBottom };
+    drawZoneSpine(zone, spine, layout.rows);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, spineTop - 2, canvas.width, bandRowsH + 4);
+    ctx.clip();
+    poolZoneDraw = zone === "pool";
+    for (var j = 0; j < layout.rows.length; j++) {
+      var row = layout.rows[j];
+      // cull rows scrolled out of the band
+      if (
+        row.screenCenter < spineTop - row.height ||
+        row.screenCenter > spineBottom + row.height
+      ) {
+        continue;
+      }
+      var b = row.branch;
+      var state = branchState(b);
+      // Only a RUNNING row is drawn bright/holding; WAITING/UNTRACED/DONE draw
+      // faint. In the pool zone several rows can run at once (real threads),
+      // so more than one may be "holding" simultaneously.
+      var holds = state === "RUNNING";
+      var activeId =
+        zone === "loop"
+          ? holds
+            ? activeNodeId(b)
+            : null
+          : !b.done && b.stack.length
+          ? activeNodeId(b)
+          : null;
+      if (b.expanded) {
+        drawBranchExpanded(
+          b,
+          spine,
+          row.screenCenter,
+          row.height,
+          1,
+          layout.metrics.get(b.traceId),
+          activeId,
+          holds
+        );
+      } else {
+        drawBranchCollapsed(b, spine, row.screenCenter, 1, activeId, holds);
+      }
+      drawRowHeader(b, state, row.screenCenter);
+    }
+    poolZoneDraw = false;
+    ctx.restore();
+
+    drawScrollbar(spine, maxScroll, layout.contentHeight, s);
+    return { rows: layout.rows, scroll: s };
+  }
+
   function render() {
     advancePlayback();
 
     ctx.fillStyle = "#0d1117";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-
     hoverRects = [];
-    // Threadpool cluster + its rect are computed/drawn in plain screen space
-    // and never touched by scrollY — it's meant to stay pinned to its corner
-    // regardless of how far the request rows have scrolled. Row nodes are
-    // already laid out in screen space too (see layoutRows), so the dashed
-    // offload edges drawn from a node to pRect (in drawNode) just work with
-    // no extra translation.
-    var pRect = drawThreadpool();
-    var spine = spineGeometry();
-    var layout = layoutRows();
-    currentRows = layout.rows; // for the click handler + scrollbar, outside this frame
 
-    // "live" = still in-flight (not done); "shown" = every kept branch,
-    // done or not — done branches persist until evicted/cleared.
-    var liveCount = 0;
+    // Split kept branches into the two zones (see b.zone, set in ingest()).
+    var loopList = [];
+    var poolList = [];
     branches.forEach(function (b) {
-      if (!b.done) liveCount++;
+      (b.zone === "pool" ? poolList : loopList).push(b);
     });
-    drawSpine(spine, layout.rows, liveCount, branches.size);
 
-    if (branches.size === 0) {
-      drawIdleHint();
-    } else {
-      for (var i = 0; i < layout.rows.length; i++) {
-        var row = layout.rows[i];
-        var b = row.branch;
-        // Finished branches no longer fade — they stay at full opacity
-        // (their nodes render in the muted "done" styling instead; see
-        // request_end in ingest() and drawNode's node.state handling).
-        var alpha = 1;
-        if (b.expanded) {
-          drawBranchExpanded(b, spine, row.screenCenter, row.height, pRect, alpha, layout.metrics.get(b.traceId));
-        } else {
-          drawBranchCollapsed(b, spine, row.screenCenter, pRect, alpha);
-        }
-        drawRequestId(b, row.screenCenter);
-      }
-    }
+    // Divider sits proportionally to each zone's row count, clamped so both
+    // headers always show.
+    var top = ZONE_TOP;
+    var bottom = canvas.height - ZONE_BOTTOM_MARGIN;
+    var avail = Math.max(40, bottom - top);
+    var n = loopList.length + poolList.length;
+    var frac = n === 0 ? 0.5 : loopList.length / n;
+    frac = Math.max(ZONE_MIN_FRAC, Math.min(ZONE_MAX_FRAC, frac));
+    dividerY = top + frac * avail;
 
-    drawScrollbar(spine, layout.maxScroll, layout.contentHeight);
+    var loopBand = { top: top, bottom: dividerY - ZONE_DIV_GAP };
+    var poolBand = { top: dividerY + ZONE_DIV_GAP, bottom: bottom };
+
+    var lr = drawZone("loop", loopBand, loopList, scrollLoop);
+    scrollLoop = lr.scroll;
+    drawDivider(dividerY);
+    var pr = drawZone("pool", poolBand, poolList, scrollPool);
+    scrollPool = pr.scroll;
+
+    currentRows = lr.rows.concat(pr.rows); // shared click/scroll hit-test
+
+    if (branches.size === 0) drawIdleHint();
+
     drawTooltip();
     requestAnimationFrame(render);
   }
@@ -1130,6 +1298,9 @@
       // Re-arm backlog skipping for this (re)connection.
       sawFirstFrame = false;
       connectBaselineT = -Infinity;
+      // Reconnecting restarts the seq baseline (the server may have restarted,
+      // and we skip the backlog again), so don't count the gap across reconnect.
+      lastSeq = null;
     };
     ws.onmessage = function (msg) {
       try {
@@ -1144,6 +1315,7 @@
           }
           return;
         }
+        for (var s = 0; s < frame.events.length; s++) noteSeq(frame.events[s].seq);
         bufferEvents(frame.events);
       } catch (e) {
         /* ignore malformed frame */
@@ -1198,7 +1370,11 @@
       hiddenTraces.clear();
       pending = [];
       loopHolder = null;
-      scrollY = 0;
+      scrollLoop = 0;
+      scrollPool = 0;
+      droppedCount = 0;
+      if (dropCountEl) dropCountEl.textContent = "0";
+      if (dropWarnEl) dropWarnEl.hidden = true;
     });
   }
 

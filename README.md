@@ -5,6 +5,12 @@ actually doing: which request currently holds the loop, which ones are
 parked at an `await`, and which sync endpoints are running on the
 threadpool — live, as a flow-graph, in your browser.
 
+It splits into two zones: an **EVENT LOOP** zone where async requests take
+turns one at a time, and a **THREADPOOL** zone where sync endpoints run on
+worker threads in real parallel. Each request is tagged with its runtime
+state — RUNNING, WAITING (at an `await`), UNTRACED (the loop is off in
+library code the tool can't see), or DONE.
+
 ## Install
 
 Python 3.12+ (required — the instrumentation uses `sys.monitoring`, PEP 669,
@@ -83,7 +89,10 @@ tool) — the dashboard reflects whatever requests hit the app.
 
 Click a row to expand/collapse its full call tree (collapsed by default to
 the active call path). Hover a node for its qualname, file:line, and await
-state.
+state. Async requests appear in the top EVENT LOOP zone (one glows = holds
+the loop), sync ones in the bottom THREADPOOL zone (several run at once). If
+the server sheds events under load, a header banner reports how many were
+dropped. The dashboard is **view-only** — it never calls your app.
 
 ## How it works
 
@@ -92,26 +101,34 @@ call/return/await-yield/await-resume boundaries. This project installs a
 single global monitor, self-pruning by filename: code outside your traced
 source directories is told to stop reporting after its first call (cheap),
 while code inside your app builds a nested call tree per request, tagged with
-suspend/resume events at each `await`. A background poller reports AnyIO
-threadpool saturation for sync `def` endpoints.
+suspend/resume events at each `await`. Each request-root frame is classified
+async (runs on the loop — including `async def … yield` dependencies) or
+offloaded (runs with no asyncio task, i.e. a sync `def` on a worker thread);
+that split drives the two zones. A background poller reports AnyIO threadpool
+saturation.
 
-Those events stream over a WebSocket to a canvas-based single-page app that
-draws the event loop as a vertical spine with one row per request. "Who
+Those events stream over a WebSocket to a canvas-based single-page app. "Who
 currently holds the loop" isn't a directly measured event — it's derived
 client-side from the stream using the fact that a standard FastAPI/uvicorn
-process has exactly one event loop thread: whichever request most recently
-entered or resumed a frame and hasn't since suspended is the one running.
+process has exactly one event loop thread: whichever async request most
+recently entered or resumed a frame and hasn't since suspended is the one
+running. Because the tool only sees your own source, the loop can vanish into
+library code between events — when that happens the holder is marked UNTRACED
+rather than pretending it's still running.
 
 See `docs/architecture.md` for the full design.
 
 ## Known limitations
 
 - Only your app's own source is traced; time spent inside stdlib,
-  site-packages, or the loop's own internals produces no events, so the
-  loop-holder highlight can't see what happens there — it holds on the last
-  known state until the next in-root event.
+  site-packages, or the loop's own internals produces no events. The tool
+  surfaces this rather than hiding it — a loop holder that goes quiet is
+  marked UNTRACED instead of appearing to still run.
 - The loop-holder highlight tracks the dashboard's slow-motion playback
   position, not wall-clock time.
+- Buffers are bounded, so a busy app can drop events; dropping isn't silent
+  (a `seq` gap raises a banner), but a trace spanning a drop may render
+  incompletely.
 - Threadpool offload attribution (which request is running on which worker)
   is best-effort: `asyncio.current_task()` is `None` on a plain worker
   thread, so there's no per-task stack to key off of there.

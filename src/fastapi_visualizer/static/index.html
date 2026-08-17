@@ -70,6 +70,11 @@
     font-size: 12px;
     color: #8b949e;
   }
+  #drop-warn {
+    font-size: 12px;
+    color: #f0883e;
+    font-family: monospace;
+  }
   #status .dot {
     display: inline-block;
     width: 8px;
@@ -149,6 +154,7 @@
 <header>
   <h1>FastAPI Async Visualizer</h1>
   <div id="status"><span class="dot"></span><span id="status-text">disconnected</span> &middot; <span id="event-count">0</span> events</div>
+  <div id="drop-warn" hidden title="the event stream is bounded; under heavy load the server sheds events, so some traces on screen may be incomplete">⚠ <span id="drop-count">0</span> events dropped — some traces may be incomplete</div>
   <div id="load">
     <span id="ld-speed-wrap">
       <label for="ld-speed">speed:</label>
@@ -173,14 +179,16 @@
     <button id="legend-toggle" title="minimize / expand">–</button>
   </div>
   <div id="legend-body">
-    <p class="lead">One event loop, one thread — only ONE request runs at a
-    time; the rest wait at an <code>await</code>.</p>
-    <div class="row"><span class="sw" style="background:hsl(210,70%,50%)"></span> running on the event loop (executing now)</div>
-    <div class="row"><span class="sw" style="background:hsl(210,80%,70%);box-shadow:0 0 6px hsl(210,90%,70%)"></span> glowing = currently <b>holds</b> the loop</div>
-    <div class="row"><span class="sw" style="background:hsl(210,30%,34%)"></span> <span class="glyph">⏸</span> waiting at an await (paused)</div>
-    <div class="row"><span class="glyph" style="color:hsl(30,90%,60%)">⇢</span> pool = blocking/sync work on a worker thread</div>
-    <div class="row"><span class="glyph" style="color:#3fb950">✓</span> finished = request done (stays until you clear)</div>
-    <div class="row"><span class="glyph" style="color:#8b949e">#</span> id = each request's id · a row = one request</div>
+    <p class="lead">Two zones. <b>EVENT LOOP</b> (top) = one thread, only ONE
+    async request runs at a time; the rest wait at an <code>await</code>.
+    <b>THREADPOOL</b> (bottom) = sync endpoints on worker threads, several
+    truly run at once.</p>
+    <div class="row"><span class="glyph" style="color:#3fb950">●</span> <b>RUNNING</b> — executing right now (on the loop, or on a worker)</div>
+    <div class="row"><span class="glyph" style="color:#8b949e">○</span> <b>WAITING</b> — parked at an <code>await</code></div>
+    <div class="row"><span class="glyph" style="color:#d29922">⋯</span> <b>UNTRACED</b> — loop is in library code outside your roots (can't see it)</div>
+    <div class="row"><span class="glyph" style="color:#6e7681">✓</span> <b>DONE</b> — request finished (stays until you clear)</div>
+    <div class="row"><span class="sw" style="background:hsl(210,80%,70%);box-shadow:0 0 6px hsl(210,90%,70%);border-radius:50%"></span> glowing spine dot = which request <b>holds</b> the loop</div>
+    <div class="row"><span class="glyph" style="color:#8b949e">#</span> id = each request's short id · a row = one request</div>
   </div>
 </div>
 <script src="./dashboard.js"></script>

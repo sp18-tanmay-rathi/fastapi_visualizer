@@ -23,9 +23,15 @@ class Event:
     task_id: int | None
     name: str
     extra: dict = field(default_factory=dict)
+    # Process-wide monotonic ordering, assigned authoritatively in
+    # Collector.push() (0 until pushed). The client uses it to detect dropped
+    # events: a jump in seq between received events means the bounded queue
+    # shed some in between.
+    seq: int = 0
 
     def to_dict(self) -> dict:
         return {
+            "seq": self.seq,
             "t": self.t,
             "kind": self.kind,
             "trace_id": self.trace_id,
