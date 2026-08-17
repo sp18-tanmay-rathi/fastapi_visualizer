@@ -32,5 +32,3 @@ live flow-graph — see `docs/plans/graph-redesign.md` and
 - [ ] Per-request offload attribution across the `run_in_threadpool`
       boundary — *contextvars don't cross threads cleanly; needs explicit
       propagation design beyond MVP scope*
-
-Source spec: `doc/fastapi-async-visualizer-plan.md` (§7 build order).

@@ -23,7 +23,6 @@ Always use `uv`, never call `pip`/`python` directly.
 - Design & mechanisms: `docs/architecture.md`
 - Active/planned work: `docs/plans/`
 - Notable changes: record under `docs/changelog.md` `[Unreleased]`
-- Original design spec (reference, **do not edit**): `doc/fastapi-async-visualizer-plan.md`
 
 ## Constraints
 

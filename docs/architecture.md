@@ -209,6 +209,3 @@ disables tracing (no leaked callbacks or DISABLE state).
   does not unify the stack across the sync/async boundary of a single
   request.
 
----
-
-Origin spec (reference only): `doc/fastapi-async-visualizer-plan.md`
