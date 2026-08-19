@@ -57,6 +57,15 @@ def sync_ep():
     return {"mode": "sync", "user": user}
 
 
+@app.get("/blocking")  # async, but does BLOCKING sync work -> freezes the loop
+async def blocking_ep():
+    # No `await`: this coroutine runs sync on the loop thread for 0.3s, so
+    # every other request is stalled the whole time. The dashboard flashes the
+    # EVENT LOOP spine red and glows this node (task 3 blocking detection).
+    time.sleep(0.3)
+    return {"mode": "blocking"}
+
+
 @app.get("/")
 async def root():
     return {"open": "/_viz"}

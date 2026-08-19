@@ -36,7 +36,17 @@ from pathlib import Path
 
 from . import identity
 from .collector import collector
-from .events import CALL_ENTER, CALL_EXIT, Event, OFFLOAD_END, OFFLOAD_START, RESUME, SUSPEND
+from .events import (
+    CALL_ENTER,
+    CALL_EXIT,
+    Event,
+    LOOP_BLOCKED,
+    LOOP_UNBLOCKED,
+    OFFLOAD_END,
+    OFFLOAD_START,
+    RESUME,
+    SUSPEND,
+)
 
 m = sys.monitoring
 
@@ -57,11 +67,27 @@ _thread_local = threading.local()
 
 
 class Monitor:
-    def __init__(self, roots: list[str]) -> None:
+    def __init__(self, roots: list[str], slow_ms: int = 100) -> None:
         self.roots = tuple(roots)
         self.enabled = False
         self.tool_id: int | None = None
         self._offloaded: set[int] = set()
+        # Blocking detection (task 3). There is NO monitoring event during a
+        # `time.sleep(0.3)` inside a coroutine — the monitor only sees the
+        # boundary before it and the boundary after. So blocking is measured
+        # retrospectively: track which in-root frame is executing on the EVENT
+        # LOOP thread and since when; at the next boundary, if that frame ran
+        # longer than `slow_ms` without yielding, the interval was a blocking
+        # span (it froze the single loop thread). Worker-thread frames are
+        # never tracked here — blocking on a worker is expected, that's the
+        # whole point of the threadpool. Loop-thread-only, so these fields are
+        # touched by exactly one thread and need no lock.
+        self._slow = max(0.0, slow_ms / 1000.0)
+        self._active_node: int | None = None
+        self._active_since: float | None = None
+        self._active_trace: str | None = None
+        self._active_task: int | None = None
+        self._active_qual: str = ""
 
     def _in_root(self, filename: str) -> bool:
         if filename.startswith(_PKG_DIR):
@@ -123,6 +149,8 @@ class Monitor:
         except Exception:
             pass
         self._offloaded.clear()
+        self._active_node = None
+        self._active_since = None
         self.tool_id = None
         self.enabled = False
 
@@ -165,6 +193,62 @@ class Monitor:
         except Exception:
             pass
 
+    # -- blocking detection (loop thread only) ---------------------------
+
+    def _loop_close(self, now: float) -> None:
+        """Close the current loop-frame interval; flag it if it ran too long.
+
+        Emits a loop_blocked (stamped at the interval START) + loop_unblocked
+        (stamped NOW) pair when the frame held the single loop thread for
+        longer than `slow_ms` without yielding. Stamping the pair at the real
+        span boundaries lets the slow-motion frontend hold the node red for the
+        (dilated) block duration.
+        """
+        node = self._active_node
+        since = self._active_since
+        self._active_node = None
+        self._active_since = None
+        if node is None or since is None or self._slow <= 0:
+            return
+        dur = now - since
+        if dur < self._slow:
+            return
+        extra = {
+            "node_id": node,
+            "qualname": self._active_qual,
+            "duration_ms": round(dur * 1000),
+        }
+        try:
+            collector.push(
+                Event(
+                    t=since,
+                    kind=LOOP_BLOCKED,
+                    trace_id=self._active_trace,
+                    task_id=self._active_task,
+                    name=self._active_qual,
+                    extra=extra,
+                )
+            )
+            collector.push(
+                Event(
+                    t=now,
+                    kind=LOOP_UNBLOCKED,
+                    trace_id=self._active_trace,
+                    task_id=self._active_task,
+                    name=self._active_qual,
+                    extra=dict(extra),
+                )
+            )
+        except Exception:
+            pass
+
+    def _loop_open(self, node_id: int, now: float, task, qual: str) -> None:
+        self._active_node = node_id
+        self._active_since = now
+        self._active_task = id(task) if task is not None else None
+        self._active_trace = identity.current_trace()
+        self._active_qual = qual
+
     # -- callbacks --------------------------------------------------------
 
     def _on_start(self, code, instruction_offset):
@@ -179,6 +263,12 @@ class Monitor:
             task, stack = self._stack()
             parent_id = stack[-1] if stack else None
             node_id = next(_node_counter)
+            now = time.monotonic()
+            # On the loop thread, calling this child is a boundary for the
+            # PARENT frame: close its interval (it ran from its own start/resume
+            # until now), then open one for the child we're entering.
+            if task is not None:
+                self._loop_close(now)
             stack.append(node_id)
             is_async = bool(code.co_flags & CO_ASYNC)
             # True threadpool signal: code running with NO current asyncio task
@@ -209,6 +299,8 @@ class Monitor:
             if is_worker and parent_id is None:
                 self._offloaded.add(node_id)
                 self._push(OFFLOAD_START, task, code.co_qualname, {"node_id": node_id})
+            if task is not None:
+                self._loop_open(node_id, now, task, code.co_qualname)
         except Exception:
             pass
 
@@ -220,10 +312,21 @@ class Monitor:
             if not stack:
                 return
             node_id = stack.pop()
+            now = time.monotonic()
+            # Returning is a boundary for THIS frame: close its interval, then
+            # re-open one for the parent that now regains control (its qualname
+            # isn't on the stack — pass "", the frontend resolves it by
+            # node_id). Empty stack -> nothing runs in-root next.
+            if task is not None:
+                self._loop_close(now)
             self._push(CALL_EXIT, task, code.co_qualname, {"node_id": node_id})
             if node_id in self._offloaded:
                 self._offloaded.discard(node_id)
                 self._push(OFFLOAD_END, task, code.co_qualname, {"node_id": node_id})
+            if task is not None:
+                parent = stack[-1] if stack else None
+                if parent is not None:
+                    self._loop_open(parent, now, task, "")
         except Exception:
             pass
 
@@ -259,6 +362,12 @@ class Monitor:
             if not stack:
                 return
             node_id = stack[-1]
+            # Yielding the loop closes the interval (this catches sync/CPU work
+            # done BEFORE the await — still a blocking span) and leaves nothing
+            # in-root running: the loop now runs the await / other tasks, so the
+            # wait time is NOT attributed to any frame.
+            if task is not None:
+                self._loop_close(time.monotonic())
             self._push(
                 SUSPEND, task, code.co_qualname, {"node_id": node_id, "awaiting": code.co_qualname}
             )
@@ -278,6 +387,14 @@ class Monitor:
             if not stack:
                 return
             node_id = stack[-1]
+            now = time.monotonic()
+            # Resuming re-establishes this frame as the one running on the loop
+            # (the interval since the last yield was await/scheduling time,
+            # already left un-attributed).
+            if task is not None:
+                self._loop_close(now)
             self._push(RESUME, task, code.co_qualname, {"node_id": node_id})
+            if task is not None:
+                self._loop_open(node_id, now, task, code.co_qualname)
         except Exception:
             pass

@@ -39,13 +39,36 @@ def _mount_dashboard(app) -> None:
         return FileResponse(STATIC_DIR / "dashboard.js")
 
     async def ws_endpoint(websocket):
+        # The stream is push-only, but we MUST still read from the socket:
+        # uvicorn's graceful shutdown closes each live connection (close 1012)
+        # and then waits for that connection's ASGI task to finish BEFORE it
+        # sends the lifespan shutdown event. A handler parked on `queue.get()`
+        # never observes the queued `websocket.disconnect`, so on an idle app
+        # it blocks forever and Ctrl+C appears to need a second press
+        # ("Waiting for background tasks to complete"). Racing a reader task
+        # against the event queue is how we see uvicorn's close.
         await websocket.accept()
         queue = collector.subscribe()
+
+        async def wait_disconnect():
+            while True:
+                msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    return
+
+        reader = asyncio.create_task(wait_disconnect())
         try:
             backlog = [e.to_dict() for e in collector.snapshot()]
             await websocket.send_json({"events": backlog})
-            while True:
-                batch = [await queue.get()]
+            while not reader.done():
+                getter = asyncio.create_task(queue.get())
+                done, _ = await asyncio.wait(
+                    {getter, reader}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if getter not in done:
+                    getter.cancel()
+                    break
+                batch = [getter.result()]
                 while not queue.empty():
                     try:
                         batch.append(queue.get_nowait())
@@ -58,6 +81,7 @@ def _mount_dashboard(app) -> None:
         except Exception:
             pass
         finally:
+            reader.cancel()
             collector.unsubscribe(queue)
 
     viz_app = Starlette(
@@ -70,7 +94,7 @@ def _mount_dashboard(app) -> None:
     app.mount("/_viz", viz_app)
 
 
-def visualize(app, roots: list[str] | None = None) -> None:
+def visualize(app, roots: list[str] | None = None, slow_ms: int = 100) -> None:
     if roots is None:
         roots = _default_roots()
     try:
@@ -83,7 +107,7 @@ def visualize(app, roots: list[str] | None = None) -> None:
     except Exception:
         pass
 
-    monitor = Monitor(roots)
+    monitor = Monitor(roots, slow_ms=slow_ms)
     state = {"monitor": monitor, "poll_task": None, "stop_event": None}
     app.state._viz = state
 

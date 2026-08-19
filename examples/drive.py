@@ -9,13 +9,18 @@ Usage — first run the demo in one terminal:
 
 then, in another terminal:
 
-    uv run python examples/drive.py              # 5 async + 5 sync, one wave
+    uv run python examples/drive.py              # 4 async + 4 sync + 1 blocking
     uv run python examples/drive.py --path /async --count 10
+    uv run python examples/drive.py --path /blocking --count 3   # watch it freeze
     uv run python examples/drive.py --waves 5 --delay 1.0
 
 Open http://127.0.0.1:8000/_viz (set the speed slider low, ~0.1x) to watch the
 async requests interleave on the event-loop spine while the sync ones run on
-the threadpool.
+the threadpool. The one /blocking request flashes the EVENT LOOP spine red
+(sync work freezing the loop) while the async rows stall behind it.
+
+The default mix is 9 requests, so it fits under the dashboard's default
+"max req" of 10 and every row (including the /blocking one) is shown.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ async def main() -> None:
         default=None,
         help="single path to hit (default: mix of /async and /sync)",
     )
-    parser.add_argument("--count", type=int, default=5, help="concurrent requests per path")
+    parser.add_argument("--count", type=int, default=4, help="concurrent requests per path")
     parser.add_argument("--waves", type=int, default=1, help="number of waves")
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between waves")
     args = parser.parse_args()
@@ -50,7 +55,7 @@ async def main() -> None:
     if args.path:
         paths = [args.path] * args.count
     else:
-        paths = ["/async"] * args.count + ["/sync"] * args.count
+        paths = ["/async"] * args.count + ["/sync"] * args.count + ["/blocking"]
 
     async with httpx.AsyncClient(base_url=args.base, timeout=30) as client:
         for i in range(args.waves):

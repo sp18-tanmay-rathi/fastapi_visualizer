@@ -6,6 +6,7 @@ a test immediately (that's the point of the safety net).
 
 import asyncio
 import os
+import time
 
 import pytest
 from fastapi import Depends, FastAPI
@@ -247,6 +248,67 @@ async def test_child_task_inherits_trace_keeps_own_task_id(client_for):
     # Same request/trace, but the parent handler and the child task run in
     # distinct asyncio tasks -> distinct task_ids under one trace_id.
     assert len(task_ids) >= 2
+
+
+# --- blocking detection (task 3) -------------------------------------------
+
+
+async def test_blocking_async_endpoint_detected(client_for):
+    app = FastAPI()
+
+    @app.get("/heavy")
+    async def heavy():
+        # sync sleep on the loop thread, no await -> blocks the loop.
+        time.sleep(0.2)
+        return {"ok": True}
+
+    @app.get("/light")
+    async def light():
+        # yields the loop -> the 0.2s is await/scheduling, not a blocking span.
+        await asyncio.sleep(0.2)
+        return {"ok": True}
+
+    # default slow_ms=100 -> 0.2s trips it, and an awaited sleep never does.
+    visualize(app, roots=[HERE])
+    collector.clear()
+    async with client_for(app) as client:
+        await client.get("/heavy")
+        await client.get("/light")
+
+    events = collector.snapshot()
+    blocked = [e for e in events if e.kind == "loop_blocked"]
+    assert blocked, "time.sleep in an async endpoint should be flagged blocking"
+
+    blocked_nodes = {e.extra.get("node_id") for e in blocked}
+    heavy_node = _node_of(events, "heavy")
+    assert heavy_node is not None
+    assert heavy_node.extra["node_id"] in blocked_nodes
+
+    # every loop_blocked has a matching loop_unblocked for the same node.
+    unblocked_nodes = {e.extra.get("node_id") for e in events if e.kind == "loop_unblocked"}
+    assert blocked_nodes <= unblocked_nodes
+
+    # the awaited-sleep handler must NOT be flagged.
+    light_node = _node_of(events, "light")
+    assert light_node is not None
+    assert light_node.extra["node_id"] not in blocked_nodes
+
+
+async def test_blocking_threshold_respected(client_for):
+    app = FastAPI()
+
+    @app.get("/quick")
+    async def quick():
+        time.sleep(0.02)  # below a 200ms threshold -> not blocking
+        return {"ok": True}
+
+    visualize(app, roots=[HERE], slow_ms=200)
+    collector.clear()
+    async with client_for(app) as client:
+        await client.get("/quick")
+
+    events = collector.snapshot()
+    assert not [e for e in events if e.kind == "loop_blocked"]
 
 
 # --- event sequence numbers (task 15) --------------------------------------

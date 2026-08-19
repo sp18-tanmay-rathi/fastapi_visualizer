@@ -13,6 +13,8 @@ RESUME = "resume"
 OFFLOAD_START = "offload_start"
 OFFLOAD_END = "offload_end"
 POOL_SAMPLE = "pool_sample"
+LOOP_BLOCKED = "loop_blocked"
+LOOP_UNBLOCKED = "loop_unblocked"
 
 
 @dataclass

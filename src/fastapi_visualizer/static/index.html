@@ -167,7 +167,7 @@
     </span>
     <span id="ld-step-wrap">
       <label for="ld-step"><input id="ld-step" type="checkbox"> step</label>
-      <button id="ld-step-btn" disabled title="apply buffered events until the loop hands off once">▶ step</button>
+      <button id="ld-step-btn" disabled title="apply buffered events until the loop hands off or a request finishes">▶ step</button>
     </span>
     <button id="ld-clear" title="remove all requests currently shown (finished ones no longer disappear on their own)">clear</button>
   </div>
@@ -187,6 +187,7 @@
     <div class="row"><span class="glyph" style="color:#8b949e">○</span> <b>WAITING</b> — parked at an <code>await</code></div>
     <div class="row"><span class="glyph" style="color:#d29922">⋯</span> <b>UNTRACED</b> — loop is in library code outside your roots (can't see it)</div>
     <div class="row"><span class="glyph" style="color:#6e7681">✓</span> <b>DONE</b> — request finished (stays until you clear)</div>
+    <div class="row"><span class="glyph" style="color:#f85149">🔥</span> <b>BLOCKED</b> — sync/CPU work in an <code>async</code> path freezing the loop</div>
     <div class="row"><span class="sw" style="background:hsl(210,80%,70%);box-shadow:0 0 6px hsl(210,90%,70%);border-radius:50%"></span> glowing spine dot = which request <b>holds</b> the loop</div>
     <div class="row"><span class="glyph" style="color:#8b949e">#</span> id = each request's short id · a row = one request</div>
   </div>
