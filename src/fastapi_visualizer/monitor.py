@@ -261,7 +261,10 @@ class Monitor:
             if identity.current_trace() is None:
                 return
             task, stack = self._stack()
-            parent_id = stack[-1] if stack else None
+            # Stack entries are (node_id, qualname) so a frame re-opened after a
+            # child returns (see _on_exit) can name itself in a loop_blocked
+            # event instead of emitting a blank qualname.
+            parent_id = stack[-1][0] if stack else None
             node_id = next(_node_counter)
             now = time.monotonic()
             # On the loop thread, calling this child is a boundary for the
@@ -269,7 +272,7 @@ class Monitor:
             # until now), then open one for the child we're entering.
             if task is not None:
                 self._loop_close(now)
-            stack.append(node_id)
+            stack.append((node_id, code.co_qualname))
             is_async = bool(code.co_flags & CO_ASYNC)
             # True threadpool signal: code running with NO current asyncio task
             # is on an anyio worker thread (that's exactly where _stack() falls
@@ -311,22 +314,21 @@ class Monitor:
             task, stack = self._stack()
             if not stack:
                 return
-            node_id = stack.pop()
+            node_id, _qual = stack.pop()
             now = time.monotonic()
             # Returning is a boundary for THIS frame: close its interval, then
-            # re-open one for the parent that now regains control (its qualname
-            # isn't on the stack — pass "", the frontend resolves it by
-            # node_id). Empty stack -> nothing runs in-root next.
+            # re-open one for the parent that now regains control, naming it
+            # from the stack entry's qualname. Empty stack -> nothing runs
+            # in-root next.
             if task is not None:
                 self._loop_close(now)
             self._push(CALL_EXIT, task, code.co_qualname, {"node_id": node_id})
             if node_id in self._offloaded:
                 self._offloaded.discard(node_id)
                 self._push(OFFLOAD_END, task, code.co_qualname, {"node_id": node_id})
-            if task is not None:
-                parent = stack[-1] if stack else None
-                if parent is not None:
-                    self._loop_open(parent, now, task, "")
+            if task is not None and stack:
+                parent_id, parent_qual = stack[-1]
+                self._loop_open(parent_id, now, task, parent_qual)
         except Exception:
             pass
 
@@ -361,7 +363,7 @@ class Monitor:
             task, stack = self._stack()
             if not stack:
                 return
-            node_id = stack[-1]
+            node_id = stack[-1][0]
             # Yielding the loop closes the interval (this catches sync/CPU work
             # done BEFORE the await — still a blocking span) and leaves nothing
             # in-root running: the loop now runs the await / other tasks, so the
@@ -386,14 +388,13 @@ class Monitor:
             task, stack = self._stack()
             if not stack:
                 return
-            node_id = stack[-1]
+            node_id = stack[-1][0]
             now = time.monotonic()
-            # Resuming re-establishes this frame as the one running on the loop
-            # (the interval since the last yield was await/scheduling time,
-            # already left un-attributed).
-            if task is not None:
-                self._loop_close(now)
             self._push(RESUME, task, code.co_qualname, {"node_id": node_id})
+            # Resuming re-establishes this frame as the one running on the loop.
+            # No _loop_close first: _on_yield already closed the prior interval
+            # (set _active_node = None), and the wait since then was
+            # await/scheduling time we deliberately leave un-attributed.
             if task is not None:
                 self._loop_open(node_id, now, task, code.co_qualname)
         except Exception:

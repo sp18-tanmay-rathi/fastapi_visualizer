@@ -205,6 +205,12 @@
   // after the others completed.)
   var MAX_REQ = 10;
 
+  // A trace can block the loop while still OVER the row cap (not yet admitted,
+  // so its branch doesn't exist). Remember that here (traceId -> worst
+  // blockedMs) so the durable "🔥 blocked" tag is applied when the trace is
+  // finally admitted, instead of the blocking fact being lost.
+  var blockedBefore = new Map();
+
   // --- Slow-motion playback -----------------------------------------
   // Requests finish in milliseconds, so applying events the instant they
   // arrive makes branches flash and vanish. Instead we BUFFER incoming
@@ -364,6 +370,12 @@
       children: [],
       isRoot: true,
     };
+    // Carry over a blocked tag recorded before this trace could be admitted.
+    if (blockedBefore.has(traceId)) {
+      b.blocked = true;
+      b.blockedMs = blockedBefore.get(traceId);
+      blockedBefore.delete(traceId);
+    }
     branches.set(traceId, b);
     return b;
   }
@@ -502,6 +514,10 @@
         if (bb) {
           bb.blocked = true; // persistent row tag (survives to DONE)
           if (dur > bb.blockedMs) bb.blockedMs = dur;
+        } else {
+          // Trace blocked while still over the row cap (not admitted yet).
+          // Stash it so the tag survives to when it IS admitted.
+          blockedBefore.set(traceId, Math.max(dur, blockedBefore.get(traceId) || 0));
         }
         if (nb) {
           nb.blocking = true;
@@ -1493,6 +1509,7 @@
     clearBtn.addEventListener("click", function () {
       branches.clear();
       nextSeq = 0;
+      blockedBefore.clear();
       pending = [];
       loopHolder = null;
       loopBlocked = null;

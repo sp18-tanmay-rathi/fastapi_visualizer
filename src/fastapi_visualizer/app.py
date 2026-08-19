@@ -51,10 +51,17 @@ def _mount_dashboard(app) -> None:
         queue = collector.subscribe()
 
         async def wait_disconnect():
-            while True:
-                msg = await websocket.receive()
-                if msg.get("type") == "websocket.disconnect":
-                    return
+            # Return on the disconnect message OR on any receive error
+            # (Starlette raises WebSocketDisconnect on some paths). Handle it
+            # explicitly rather than relying on the task dying to end the outer
+            # loop.
+            try:
+                while True:
+                    msg = await websocket.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        return
+            except Exception:
+                return
 
         reader = asyncio.create_task(wait_disconnect())
         try:

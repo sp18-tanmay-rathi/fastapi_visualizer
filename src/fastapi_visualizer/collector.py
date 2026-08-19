@@ -77,7 +77,13 @@ class Collector:
         try:
             loop = asyncio.get_running_loop()
         except Exception:
-            return q  # no loop (shouldn't happen: called from the WS handler)
+            # No running loop: the queue can't be registered for delivery, so
+            # it would silently receive nothing. subscribe() is meant to be
+            # called from the async WS handler; surface the misuse loudly
+            # rather than handing back a dead queue.
+            raise RuntimeError(
+                "Collector.subscribe() requires a running event loop"
+            ) from None
         with self._lock:
             self._subscribers[q] = loop
         return q
