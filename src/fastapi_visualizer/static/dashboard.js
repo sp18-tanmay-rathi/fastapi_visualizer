@@ -73,6 +73,16 @@
   // confident bright glow.
   var UNTRACED_AFTER = 0.15;
 
+  // Blocking flash (task 3) is inherently RETROSPECTIVE: no event fires while
+  // the loop is frozen, so loop_blocked (stamped at the span start) and
+  // loop_unblocked (span end) only arrive together at the span's end and get
+  // applied in the same drain — making the red flash instant/invisible.
+  // Instead we light the flash for a fixed REAL-TIME window on ingest of
+  // loop_blocked (scaled a bit by the block length, clamped), independent of
+  // the playback clock, so it's clearly visible in both live and step mode.
+  var BLOCK_FLASH_MIN_MS = 900;
+  var BLOCK_FLASH_MAX_MS = 3000;
+
   var canvas = document.getElementById("viz");
   var ctx = canvas.getContext("2d");
   var statusEl = document.getElementById("status");
@@ -164,6 +174,15 @@
   // single-threaded asyncio event loop this is visualizing.
   var loopHolder = null;
 
+  // Blocking span freezing the EVENT LOOP (task 3), or null. Set on a
+  // loop_blocked event with a real-time expiry (`until`); cleared in render()
+  // when that expires (NOT by loop_unblocked — see the ingest note). While set,
+  // the loop spine flashes red ("🔥 BLOCKED by <qualname> (Ns)") and the
+  // offending node draws a hot red glow — surfacing the classic async failure:
+  // sync/CPU work inside a coroutine stalling every other request.
+  // { traceId, node_id, qualname, duration_ms, until }
+  var loopBlocked = null;
+
   // Latest threadpool sample.
   var pool = { borrowed: 0, total: POOL_DEFAULT_TOTAL, queued: 0 };
 
@@ -173,18 +192,24 @@
   var poolZoneDraw = false;
 
   // --- Request cap / MAX ROWS KEPT -------------------------------------
-  // Only up to MAX_REQ requests are ever KEPT on screen at once (header
-  // "max req" control, default 10 — now means "max rows kept", since
-  // finished rows no longer free themselves on a timer). When a brand-new
-  // trace shows up and we're already at the cap (see getOrCreateBranch):
-  // the OLDEST (lowest seq) branch that is already `done` is evicted to
-  // make room. If every kept branch is still live/in-flight, there's no
-  // done row to sacrifice, so the new trace is added to hiddenTraces and
-  // every subsequent event for it is dropped on the floor (still fine to
-  // count it toward the event counter). "clear" (see #ld-clear handler)
-  // wipes hiddenTraces too, so previously-hidden traces don't reappear.
+  // Only up to MAX_REQ requests are KEPT on screen at once (header "max req"
+  // control, default 10 — "max rows kept", since finished rows no longer free
+  // themselves on a timer). When a brand-new trace shows up at the cap (see
+  // getOrCreateBranch): the OLDEST (lowest seq) branch that is already `done`
+  // is evicted to make room. If every kept branch is still live/in-flight,
+  // there's no done row to sacrifice, so THIS event is dropped — but the trace
+  // is NOT permanently blacklisted: its next event retries admission, so as
+  // soon as one of the live rows finishes it gets a slot and appears. (An
+  // earlier version added it to a sticky hidden set and dropped it forever,
+  // which meant an over-cap request in a simultaneous burst never showed even
+  // after the others completed.)
   var MAX_REQ = 10;
-  var hiddenTraces = new Set(); // trace_ids we decided not to display
+
+  // A trace can block the loop while still OVER the row cap (not yet admitted,
+  // so its branch doesn't exist). Remember that here (traceId -> worst
+  // blockedMs) so the durable "🔥 blocked" tag is applied when the trace is
+  // finally admitted, instead of the blocking fact being lost.
+  var blockedBefore = new Map();
 
   // --- Slow-motion playback -----------------------------------------
   // Requests finish in milliseconds, so applying events the instant they
@@ -257,14 +282,14 @@
     }
   }
 
-  // Drain buffered events one at a time until the loop hand-off completes:
-  // apply events in order and stop as soon as loopHolder becomes a NEW,
-  // non-null trace (different from whichever trace held it — or didn't —
-  // right before this click). A suspend that merely clears loopHolder to
-  // null does not count as a stop point; we keep draining through that until
-  // an actual new holder takes over, so one click = one hand-off of the loop
-  // from one request to the next. If the buffer runs dry first, we just stop
-  // there (apply what's there).
+  // Drain buffered events in order until the next CHECKPOINT: either the loop
+  // hands off to a new holder (async detail), OR a request finishes
+  // (request_end). A suspend that merely clears loopHolder to null is not a
+  // stop point — we drain through it until a real new holder takes over.
+  // Including request_end matters for sync/threadpool traffic, which never
+  // sets loopHolder: without it a step would drain the whole buffer at once
+  // and then look frozen; with it, each click completes one request. If the
+  // buffer runs dry first, we stop there (apply what's there).
   function doStep() {
     var before = loopHolder;
     var applied = 0;
@@ -273,7 +298,15 @@
       ingest([ev]);
       applied++;
       virtualT = ev.t;
+      // A step advances to the next CHECKPOINT, defined as either:
+      //  - a LOOP hand-off: the loop passed to a new async request, or
+      //  - a REQUEST finishing (request_end).
+      // Sync/threadpool work never touches loopHolder (it isn't ON the loop),
+      // so hand-offs never happen for pure sync traffic — without the
+      // request_end checkpoint a step would drain the whole buffer at once and
+      // then look frozen. With it, each click visibly completes one request.
       if (loopHolder !== before && loopHolder !== null) break;
+      if (ev.kind === "request_end") break;
     }
     pending = pending.slice(applied);
   }
@@ -285,12 +318,11 @@
   function getOrCreateBranch(traceId) {
     var b = branches.get(traceId);
     if (b) return b;
-    if (hiddenTraces.has(traceId)) return null;
 
-    // At cap: evict the OLDEST done branch (lowest seq) to make room for
-    // this new trace. If nothing kept is done (all still in-flight), there's
-    // no safe row to give up — hide the new trace instead, same as the old
-    // over-cap behavior.
+    // At cap: evict the OLDEST done branch (lowest seq) to make room. If
+    // nothing kept is done (all still in-flight), there's no safe row to give
+    // up — drop THIS event and return null. We do NOT blacklist the trace, so
+    // its next event retries and it appears the moment a row finishes.
     if (branches.size >= MAX_REQ) {
       var evictId = null;
       var evictSeq = Infinity;
@@ -303,7 +335,6 @@
       if (evictId !== null) {
         branches.delete(evictId);
       } else {
-        hiddenTraces.add(traceId);
         return null;
       }
     }
@@ -326,6 +357,11 @@
       // Server-time of the most recent in-root event for this trace; used to
       // decide when a loop holder has gone "untraced" (task 4).
       lastEventT: 0,
+      // Set once this request has EVER blocked the loop (a loop_blocked span);
+      // persists through DONE so the row is durably tagged "🔥 blocked", not
+      // just flashed for the moment. blockedMs = longest such span, for the tag.
+      blocked: false,
+      blockedMs: 0,
     };
     b.rootNode = {
       id: "root:" + traceId,
@@ -334,6 +370,12 @@
       children: [],
       isRoot: true,
     };
+    // Carry over a blocked tag recorded before this trace could be admitted.
+    if (blockedBefore.has(traceId)) {
+      b.blocked = true;
+      b.blockedMs = blockedBefore.get(traceId);
+      blockedBefore.delete(traceId);
+    }
     branches.set(traceId, b);
     return b;
   }
@@ -360,7 +402,6 @@
       }
 
       if (!traceId) continue; // every other kind is scoped to a request
-      if (hiddenTraces.has(traceId)) continue; // over the request cap: ignore
 
       if (ev.kind === "request_start") {
         var b0 = getOrCreateBranch(traceId);
@@ -460,6 +501,43 @@
           if (n5.awaiting) n5.awaitDone = true; // the await it was blocked on resolved
         }
         if (b5.zone === "loop") loopHolder = traceId;
+        continue;
+      }
+
+      if (ev.kind === "loop_blocked") {
+        var bb = branches.get(traceId);
+        var nb = bb && bb.nodesById.get(extra.node_id);
+        var dur = extra.duration_ms || 0;
+        var until =
+          performance.now() +
+          Math.max(BLOCK_FLASH_MIN_MS, Math.min(BLOCK_FLASH_MAX_MS, dur));
+        if (bb) {
+          bb.blocked = true; // persistent row tag (survives to DONE)
+          if (dur > bb.blockedMs) bb.blockedMs = dur;
+        } else {
+          // Trace blocked while still over the row cap (not admitted yet).
+          // Stash it so the tag survives to when it IS admitted.
+          blockedBefore.set(traceId, Math.max(dur, blockedBefore.get(traceId) || 0));
+        }
+        if (nb) {
+          nb.blocking = true;
+          nb.blockUntil = until;
+        }
+        loopBlocked = {
+          traceId: traceId,
+          node_id: extra.node_id,
+          qualname: (nb && nb.qualname) || extra.qualname || "?",
+          duration_ms: dur,
+          until: until,
+        };
+        continue;
+      }
+
+      if (ev.kind === "loop_unblocked") {
+        // Visual flash is time-driven (see BLOCK_FLASH_*), so we DON'T clear it
+        // here — loop_unblocked arrives in the same drain as loop_blocked, and
+        // clearing now would make the red invisible. The real-time expiry set
+        // above (checked in render()/drawNode) ends the flash instead.
         continue;
       }
 
@@ -752,6 +830,38 @@
     ctx.stroke();
     ctx.restore();
 
+    // Blocking flash (task 3): a coroutine is freezing the loop. Overpaint the
+    // whole loop spine red + label; it takes precedence over the holder marker
+    // (the block IS what's holding the loop, just not yielding).
+    if (zone === "loop" && loopBlocked) {
+      ctx.save();
+      ctx.strokeStyle = "#f85149";
+      ctx.shadowColor = "#f85149";
+      ctx.shadowBlur = 12;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(spine.x, spine.top);
+      ctx.lineTo(spine.x, spine.bottom);
+      ctx.stroke();
+      ctx.restore();
+
+      ctx.save();
+      ctx.fillStyle = "#f85149";
+      ctx.font = "bold 11px monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      var secs = (loopBlocked.duration_ms / 1000).toFixed(2);
+      ctx.fillText(
+        "🔥 BLOCKED by " + loopBlocked.qualname + " (" + secs + "s)",
+        spine.x + 10,
+        spine.top + 2
+      );
+      ctx.restore();
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      return;
+    }
+
     if (zone !== "loop" || !loopHolder) return;
     var hb = branches.get(loopHolder);
     if (!hb || hb.zone !== "loop") return;
@@ -862,6 +972,22 @@
       ctx.shadowBlur = 14;
       ctx.lineWidth = 2.5;
       ctx.strokeStyle = "hsl(" + hue + ", 90%, 70%)";
+      ctx.strokeRect(x - w / 2 - 3, y - h / 2 - 3, w + 6, h + 6);
+      ctx.restore();
+    }
+
+    // Blocking span (task 3): this frame is running sync/CPU work that is
+    // freezing the loop. Hot red glow, drawn over the holder ring so it wins.
+    // Expires on the same real-time window as the spine flash.
+    if (node.blocking && node.blockUntil && performance.now() > node.blockUntil) {
+      node.blocking = false;
+    }
+    if (node.blocking) {
+      ctx.save();
+      ctx.shadowColor = "#f85149";
+      ctx.shadowBlur = 18;
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "#ff6a5f";
       ctx.strokeRect(x - w / 2 - 3, y - h / 2 - 3, w + 6, h + 6);
       ctx.restore();
     }
@@ -994,7 +1120,20 @@
     var st = STATE_STYLE[state] || STATE_STYLE.WAITING;
     ctx.font = "10px monospace";
     ctx.fillStyle = st.color;
-    ctx.fillText(st.glyph + " " + st.label, ROOT_X - NODE_W / 2 + idW + 10, y);
+    var stateText = st.glyph + " " + st.label;
+    var stateX = ROOT_X - NODE_W / 2 + idW + 10;
+    ctx.fillText(stateText, stateX, y);
+
+    // Durable "blocked" tag: this request froze the loop at some point. Shown
+    // alongside the live state (e.g. "✓ DONE   🔥 blocked 0.30s"), so a
+    // finished request still records that it blocked — not just a flash.
+    if (b.blocked) {
+      var sw = ctx.measureText(stateText).width;
+      ctx.fillStyle = "#f85149";
+      var tag = "🔥 blocked";
+      if (b.blockedMs) tag += " " + (b.blockedMs / 1000).toFixed(2) + "s";
+      ctx.fillText(tag, stateX + sw + 12, y);
+    }
 
     ctx.textBaseline = "alphabetic";
     ctx.restore();
@@ -1247,6 +1386,9 @@
   function render() {
     advancePlayback();
 
+    // Expire the blocking flash on its real-time window (see BLOCK_FLASH_*).
+    if (loopBlocked && performance.now() > loopBlocked.until) loopBlocked = null;
+
     ctx.fillStyle = "#0d1117";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     hoverRects = [];
@@ -1367,9 +1509,10 @@
     clearBtn.addEventListener("click", function () {
       branches.clear();
       nextSeq = 0;
-      hiddenTraces.clear();
+      blockedBefore.clear();
       pending = [];
       loopHolder = null;
+      loopBlocked = null;
       scrollLoop = 0;
       scrollPool = 0;
       droppedCount = 0;

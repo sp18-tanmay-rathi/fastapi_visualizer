@@ -8,6 +8,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Blocking detection** (Phase 2, plan task 3): sync/CPU work inside a
+  coroutine (`time.sleep`, a tight loop, a blocking driver call) freezes the
+  single loop thread and stalls every other request — the classic async
+  failure. `monitor.py` now measures wall-time per in-root loop frame between
+  monitoring boundaries and, when a frame holds the loop longer than `slow_ms`
+  (default 100, new `visualize(app, slow_ms=)` arg) without yielding, emits a
+  `loop_blocked`/`loop_unblocked` span. The dashboard glows the offending node
+  hot red and flashes the EVENT LOOP spine red with "🔥 BLOCKED by X (Ns)".
+  Worker-thread work is never flagged (blocking there is expected). New
+  `/blocking` demo endpoint exercises it.
 - **Explicit runtime states** (Phase 1, plan task 4): each request row is
   tagged RUNNING / WAITING / UNTRACED / DONE instead of the dashboard inferring
   a single "loop holder" from the last event. UNTRACED shows when the loop
@@ -67,6 +77,43 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Offloaded sync requests no longer hang RUNNING forever in the live view.**
+  `Collector.push()` fanned events out to subscriber `asyncio.Queue`s with a
+  bare `put_nowait`. That is not thread-safe: a sync endpoint's
+  `call_exit`/`offload_end` (and any offloaded-frame event) is pushed from an
+  anyio **worker thread**, and a cross-thread `put_nowait` does not wake the
+  loop parked in `await queue.get()`, so those completion events were stranded
+  in the ring buffer and never streamed — the dashboard's threadpool rows sat
+  at RUNNING and never reached DONE. Delivery is now scheduled on each
+  subscriber's own loop via `call_soon_threadsafe`. (Loop-thread events, e.g.
+  async requests, were unaffected, which is why only sync rows hung.)
+- **Spurious "N events dropped" banner.** `Collector.push()` incremented the
+  shared `seq` (a non-atomic read-modify-write) and scheduled fan-out from both
+  the event loop and worker threads without synchronization, so two threads
+  could grab the same seq or deliver out of seq order — which the client's
+  gap detector read as dropped events. `push()`/`subscribe()`/`clear()` now
+  hold a `threading.Lock`, so seq is unique/contiguous and deliveries are
+  scheduled in seq order.
+- **Over-cap requests never reappeared after a row finished.** A new trace
+  arriving while all `max req` rows were still in-flight was added to a sticky
+  hidden set and dropped forever — so an over-cap request in a simultaneous
+  burst (e.g. the demo's `/blocking`, the 11th of 11) stayed invisible even
+  after the others completed, and never flashed its blocking state. The hidden
+  set is gone; such an event is dropped only for that instant and the trace is
+  admitted (evicting the oldest finished row) as soon as a slot frees.
+- **Step mode no longer appears stuck on threadpool traffic.** A step now
+  advances until the loop hands off OR a request finishes; sync/threadpool work
+  never touches the loop holder, so without the request-finish checkpoint a
+  step drained the whole buffer at once and then looked frozen.
+- **Ctrl+C no longer needs a second press.** The `/_viz/ws` handler was
+  push-only and never read from the socket, so it could not see the
+  `websocket.disconnect` uvicorn queues when it closes live connections
+  (close 1012) during graceful shutdown. Uvicorn waits for each connection's
+  ASGI task *before* sending the lifespan shutdown event, so with the
+  dashboard open and the app idle the handler blocked on `queue.get()` forever
+  and the server sat at "Waiting for background tasks to complete. (CTRL+C to
+  force quit)". The handler now races a reader task against the event queue and
+  exits on disconnect.
 - **Async-generator dependencies no longer mislabeled as threadpool work**
   (Phase 1, plan task 6). `is_async` now tests `CO_COROUTINE | CO_ASYNC_GENERATOR`
   so an `async def ... yield` dependency (e.g. FastAPI's `get_db`) reads as

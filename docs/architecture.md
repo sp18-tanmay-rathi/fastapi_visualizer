@@ -69,12 +69,40 @@ fields the frontend keys its two zones off of:
 | `offload_start` | `{node_id}` | a worker-thread (offloaded sync) call started |
 | `offload_end` | `{node_id}` | that offloaded call returned |
 | `pool_sample` | `{borrowed, total, queued}` | threadpool occupancy (emitted only on change) |
+| `loop_blocked` | `{node_id, qualname, duration_ms}` | an in-root loop frame ran > `slow_ms` without yielding (stamped at the span START) |
+| `loop_unblocked` | `{node_id, qualname, duration_ms}` | the blocking span ended (stamped at the span END) |
 
 `Event` is `{seq, t, kind, trace_id, task_id, name, extra}` (`events.py`), with
 `to_dict()` for JSON. `node_id` is a global monotonically increasing int
 assigned at `call_enter` and matched by `call_exit`. `seq` is a process-wide
 monotonic counter assigned authoritatively in `Collector.push()` — the client
 detects dropped events by watching for gaps in it (see Data flow).
+
+### Blocking detection
+
+The classic async failure is sync/CPU work inside a coroutine (`time.sleep`, a
+tight loop, a blocking driver call) — it freezes the single loop thread, so
+*every* other request stalls until it finishes. There is **no monitoring event
+during** such a stall: the monitor sees `PY_START` … (300ms of nothing) …
+`PY_RETURN`. So blocking is measured **retrospectively, per interval between
+boundaries**, not as a "start → blocked → resume" state.
+
+`monitor.py` tracks which in-root frame is executing **on the event-loop
+thread** and since when (`_active_node`/`_active_since`, updated at every
+`PY_START`/`PY_RESUME`/`PY_YIELD`/`PY_RETURN`). At each boundary it closes the
+open interval: if the frame held the loop longer than `slow_ms` (default 100,
+via `visualize(app, slow_ms=)`) without yielding, that interval was a blocking
+span, and a `loop_blocked` (stamped at the span start) + `loop_unblocked`
+(stamped at the span end) pair is emitted. Stamping the pair at the real span
+boundaries lets the slow-motion frontend hold the node red for the dilated
+block duration.
+
+Only **loop-thread** frames are tracked (`asyncio.current_task()` is not
+`None`); worker-thread work is never flagged, because blocking on a worker is
+expected — that's the point of the threadpool. Because it's a single thread,
+the interval fields need no lock. Yielding (`PY_YIELD`) closes the interval and
+leaves nothing attributed, so the await/scheduling wait is never counted as
+blocking; a long run *before* an await still is.
 
 ### Identity
 
@@ -115,7 +143,13 @@ necessarily **best-effort** (see Known limitations).
 Instrumentation (monitoring callbacks + limiter poll) pushes `Event` objects
 into the **Collector**, a bounded ring buffer (`deque(maxlen=5000)`) that
 stamps each event with a monotonic `seq` and fans it out to subscriber queues
-(each bounded; oldest dropped on overflow). The `/_viz/ws` WebSocket handler
+(each bounded; oldest dropped on overflow). Events are pushed from **two kinds
+of thread** — the event loop (middleware, async callbacks) and anyio worker
+threads (callbacks for offloaded sync frames) — and `asyncio.Queue` is not
+thread-safe, so each delivery is scheduled on the subscriber's own loop via
+`loop.call_soon_threadsafe`. A plain `put_nowait` from a worker thread does not
+wake the loop blocked in `await queue.get()`, which would strand a sync
+endpoint's `call_exit`/`offload_end` and leave its row RUNNING forever. The `/_viz/ws` WebSocket handler
 batches whatever is on its queue into a frame roughly every 33ms (~30fps) and
 sends it to the browser; on connect it first sends a one-time backlog
 snapshot of everything currently in the ring buffer. Because the buffers are
@@ -145,7 +179,7 @@ reqs →  │  event loop (1 thread)          AnyIO threadpool (≤40 tokens)   
 {"events": [{"seq": 1, "t": 0.0, "kind": "...", "trace_id": "...", "task_id": 0, "name": "...", "extra": {}}]}
 ```
 
-`kind` is one of the nine values in the table above.
+`kind` is one of the eleven values in the table above.
 
 ## Frontend: the flow graph
 
@@ -177,6 +211,15 @@ issues requests to the app; traffic is driven externally (curl, httpx,
   untraced" instead of a confident glow.
 - **Suspended nodes** are dimmed, tagged ⏸, and connect to their parent with a
   faint dashed edge ("parked").
+- **Blocking (EVENT LOOP zone)**: detection is retrospective — no event fires
+  while the loop is frozen, so `loop_blocked` (span start) and `loop_unblocked`
+  (span end) only arrive together at the end. On `loop_blocked` the loop spine
+  overpaints red with "🔥 BLOCKED by `<qualname>` (Ns)" and the node glows red
+  for a short **real-time** window (clamped by the span length), independent of
+  the playback clock so it's visible in both live and step mode. The affected
+  request also gets a **durable** "🔥 blocked" tag next to its runtime state
+  that persists through DONE, so a finished request still records that it froze
+  the loop. This surfaces sync/CPU work stalling every other request.
 - **Threadpool zone**: the whole zone means "on a worker thread", so the
   per-node "⇢ pool" stub is suppressed there; the worker-token grid
   (`borrowed/total`, filled cells) lives in the zone header.
