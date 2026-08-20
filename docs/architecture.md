@@ -60,8 +60,8 @@ fields the frontend keys its two zones off of:
 
 | kind | extra fields | meaning |
 |---|---|---|
-| `request_start` | `{method, path}` | a request began; branch root created for its trace_id |
-| `request_end` | `{}` | the request finished |
+| `request_start` | `{method, path, request_id}` | a request began; branch root created for its trace_id. `request_id` = inbound `X-Request-ID`, or null |
+| `request_end` | `{status, duration_ms, error?}` | the request finished; `status` is null if no response started, `error` is the exception class name if the app raised |
 | `call_enter` | `{node_id, parent_id, qualname, file, line, is_async, execution}` | entered a function frame (a graph node); `execution` = `"event_loop"` or `"threadpool"` |
 | `call_exit` | `{node_id}` | that frame returned or unwound |
 | `suspend` | `{node_id, awaiting}` | frame hit an `await` and yielded the loop |
@@ -104,6 +104,40 @@ the interval fields need no lock. Yielding (`PY_YIELD`) closes the interval and
 leaves nothing attributed, so the await/scheduling wait is never counted as
 blocking; a long run *before* an await still is.
 
+### Enable gate
+
+`visualize()` resolves an `enabled` decision **before touching the app at all**
+(`app.py:_resolve_enabled`): an explicit `enabled=` wins, else `FASTAPI_VIZ` in
+the environment, else `app.debug`. When it resolves off, nothing is installed
+and nothing is mounted — no middleware, no task factory, no `Monitor`, no
+threadpool poller, no lifespan wrap, no `/_viz` route — so the call is safe to
+leave in an app that ships to production. `app.state._viz` is set to
+`{"enabled": False}` so the decision is introspectable, and one line is printed
+explaining how to turn it on.
+
+Deliberately absent: the old unconditional `loop.set_debug(True)`. It changed
+the host app's behavior (slow-callback logging, coroutine origin tracking) and
+cost overhead, and blocking detection does not need it — the monitor times wall
+clock between `sys.monitoring` boundaries itself rather than reading asyncio's
+slow-callback machinery.
+
+Note the enable gate is about **not installing uninvited**, not about access
+control: when enabled, the dashboard and its WebSocket are unauthenticated.
+
+### Mount path
+
+The dashboard mounts at `path` (default `/_viz`), normalized by
+`_normalize_mount_path()` to a leading slash with no trailing one so
+`"_viz"`, `"/_viz/"` and `"/debug/viz/"` all behave. A root mount raises
+`ValueError` rather than silently shadowing the app's own routes — a config
+mistake, not an instrumentation error, so fail-soft does not apply (same
+reasoning as `Collector.subscribe()` raising without a running loop).
+
+Nothing downstream is told the path: the page and the socket are siblings under
+the mount, and `dashboard.js` derives its WebSocket URL from its own
+`location.pathname` (`wsUrl()`). That keeps a configurable path compatible with
+the no-build-step/offline constraint — no templating, no injected config.
+
 ### Identity
 
 `identity.py` mints a trace id per request in a pure-ASGI `TraceMiddleware`
@@ -114,6 +148,24 @@ contextvar, and emits `request_start`/`request_end`. A wrapped task factory
 `asyncio.create_task()` calls stay attributed to the same request.
 `current_trace()` reads the Task attribute first, falling back to the
 contextvar.
+
+Trace ids are `secrets.token_hex(8)` (16 hex chars) — wide enough not to collide
+under real load. The dashboard displays a 6-char prefix on each row and keeps
+the full id in the request inspector.
+
+**Request outcome.** `TraceMiddleware` wraps the ASGI `send` callable and reads
+`status` off the `http.response.start` message. It deliberately never touches
+or buffers response bodies — status is all that's needed, and buffering would
+change streaming behavior. The wrapper is also where `expose_request_id=True`
+appends an `x-request-id` response header. `request_end` then carries `status`,
+a `duration_ms` measured from middleware entry, and `error` (the exception class
+name) when the application raised — the exception is re-raised, never swallowed.
+
+**Request-id correlation.** An inbound `X-Request-ID` is always recorded on
+`request_start` for correlation against upstream logs, but only replaces the
+generated trace id when `correlate_request_id=True`; otherwise a client could
+choose its own id. A correlated id is filtered to `[A-Za-z0-9._-]` and truncated
+to 64 chars, since it is rendered in the UI and used as a map key.
 
 ### Threadpool
 
@@ -223,8 +275,25 @@ issues requests to the app; traffic is driven externally (curl, httpx,
 - **Threadpool zone**: the whole zone means "on a worker thread", so the
   per-node "⇢ pool" stub is suppressed there; the worker-token grid
   (`borrowed/total`, filled cells) lives in the zone header.
+- **Outcome tag** per row once finished: `200 · 42ms`, amber past the
+  frontend-configurable slow threshold (`slow req`, default 500ms), red for a
+  5xx or a raised exception. Derived from `request_end.extra`, with a fallback
+  to the `request_end.t - request_start.t` delta if those fields are missing.
+- **Request inspector**: clicking a row selects it and opens a DOM overlay
+  (bottom-right) with full trace id, inbound request id, status, duration, zone,
+  asyncio task count, call-node count, suspension count and blocking spans. DOM
+  rather than canvas because the trace id must be selectable text; repainted on
+  selection change and at most every 200ms while the request is live.
+- **Row filter**: `path:` / `status:` / `slow:` / `zone:` terms plus bare
+  substrings, ANDed. Applied where `render()` splits branches into the two zone
+  lists — strictly display-only, it never affects row admission or recording.
+- **Cross-request qualname highlight**: hovering a node outlines every frame of
+  the same function in every other row. `hoverQual` is resolved from the
+  *previous* frame's `hoverRects` (one frame of lag, imperceptible), which
+  avoids a second layout pass.
 - **Collapsed by default**: a row shows only its active call-path chain with a
-  "[+N]" badge for the rest; click a row to expand/collapse its full tree.
+  "[+N]" badge for the rest; clicking a row expands/collapses its full tree
+  (the same click that selects it for the inspector).
 - **Variable-height rows**, stacked in arrival order, with per-zone
   mouse-wheel scroll and a scrollbar when a zone's stack overflows its band.
 - **Slow-motion playback**: incoming events are buffered and replayed against
@@ -278,6 +347,12 @@ disables tracing (no leaked callbacks or DISABLE state).
   banner — but a trace spanning a drop may still render incompletely.
 - The loop-holder highlight tracks **playback position** (the slow-motion
   virtual clock), not wall-clock time.
+- **The dashboard is unauthenticated when enabled.** The enable gate stops it
+  installing uninvited; it is not access control. Anyone who can reach the port
+  can read every path and the app's source structure. No token option yet.
+- **Multi-worker is not aggregated.** `uvicorn --workers N` gives each process
+  its own loop and its own in-memory collector, so the dashboard shows only the
+  worker that served `/_viz`. Run a single worker.
 - **Threadpool offload attribution is best-effort**: `sys.monitoring`
   callbacks fire on whichever OS thread runs the code, and
   `asyncio.current_task()` is `None` on a plain worker thread, so there is no

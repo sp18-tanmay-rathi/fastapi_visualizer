@@ -13,7 +13,13 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     overflow: hidden;
   }
+  /* Flex column instead of subtracting a hardcoded header height: the header
+     wraps to two rows on a narrow window (it has a lot of controls now), which
+     used to leave the canvas sized for a one-row header — stretched bitmap,
+     overlays sitting on top of the header. */
+  body { display: flex; flex-direction: column; }
   header {
+    flex: 0 0 auto;
     padding: 8px 14px;
     background: #161b22;
     border-bottom: 1px solid #30363d;
@@ -45,6 +51,8 @@
     font-size: 12px;
   }
   #load input#ld-maxreq { width: 40px; }
+  #load input#ld-slow { width: 58px; }
+  #load input#ld-filter { width: 220px; }
   #load button {
     background: #238636;
     color: #fff;
@@ -65,7 +73,11 @@
   #ld-speed-wrap { display: flex; align-items: center; gap: 6px; }
   #ld-speed { width: 96px; }
   #ld-speed-val { font-family: monospace; color: #c9d1d9; min-width: 44px; }
-  #ld-maxreq-wrap, #ld-step-wrap { display: flex; align-items: center; gap: 6px; }
+  #ld-maxreq-wrap, #ld-step-wrap, #ld-slow-wrap, #ld-filter-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
   #status {
     font-size: 12px;
     color: #8b949e;
@@ -86,36 +98,81 @@
   #status.connected .dot {
     background: #3fb950;
   }
+  #stage {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
   #viz {
     display: block;
-    width: 100vw;
-    height: calc(100vh - 37px);
+    width: 100%;
+    height: 100%;
     background: #0d1117;
   }
-  /* Intern helper: fixed top-right overlay, minimizeable. */
-  #legend {
-    position: fixed;
-    top: 46px;
+  /* --- Right-side overlay column ------------------------------------------
+     The legend (reference) pins to the top and the inspector (live detail) to
+     the bottom of one flex column, so they can never overlap each other no
+     matter how short the window is: each shrinks into its own scroll instead.
+     pointer-events:none on the column matters — otherwise this 340px strip
+     would swallow canvas clicks and wheel scrolling in the gap between the
+     two panels. */
+  #overlays {
+    position: absolute;
+    top: 12px;
     right: 12px;
+    bottom: 12px;
     width: 340px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 10px;
+    z-index: 10;
+    pointer-events: none;
+  }
+  #overlays > * { pointer-events: auto; }
+
+  /* Shared panel chrome. */
+  #legend,
+  #inspector {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0; /* let the body scroll instead of overflowing the column */
     background: rgba(13, 17, 23, 0.94);
     border: 1px solid #30363d;
     border-radius: 6px;
     font-size: 11px;
     color: #c9d1d9;
-    z-index: 10;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   }
-  #legend-head {
+  /* When space runs short, give it up from the legend first — the inspector is
+     showing live data the user just clicked for. */
+  #legend { flex-shrink: 4; }
+  #inspector { flex-shrink: 1; }
+
+  #legend-head,
+  #inspector-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
+    flex: 0 0 auto;
     padding: 7px 10px;
     border-bottom: 1px solid #30363d;
     cursor: pointer;
   }
-  #legend-head b { color: #e6edf3; font-size: 11px; }
-  #legend-toggle {
+  #legend-head b,
+  #inspector-head b {
+    color: #e6edf3;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #inspector-head b { font-family: monospace; }
+  #legend-toggle,
+  #inspector-toggle {
     background: none;
     border: 0;
     color: #8b949e;
@@ -123,31 +180,84 @@
     font-size: 13px;
     line-height: 1;
     padding: 0 2px;
+    flex: 0 0 auto;
   }
-  #legend.min #legend-body { display: none; }
-  #legend.min { width: auto; }
-  #legend.min #legend-head { border-bottom: 0; }
-  #legend-body { padding: 8px 10px; }
+  #legend-body,
+  #inspector-body {
+    overflow-y: auto;
+    min-height: 0;
+  }
+  /* An id selector outranks the UA `[hidden] { display: none }` rule, so the
+     `display: flex` above would keep the inspector visible when JS sets
+     hidden. Restore it explicitly. */
+  #inspector[hidden] { display: none; }
+  #legend.min,
+  #inspector.min { width: auto; }
+  #legend.min #legend-body,
+  #inspector.min #inspector-body { display: none; }
+  #legend.min #legend-head,
+  #inspector.min #inspector-head { border-bottom: 0; }
+
+  /* --- Legend body -------------------------------------------------------- */
+  #legend-body { padding: 9px 11px 11px; }
   #legend-body .lead {
     color: #e6edf3;
-    font-weight: 600;
-    margin: 0 0 8px;
-    line-height: 1.35;
+    margin: 0 0 10px;
+    line-height: 1.5;
+    padding-bottom: 9px;
+    border-bottom: 1px solid #21262d;
   }
+  /* Grid, not flex: a fixed glyph column plus a wrapping text column lines the
+     glyph up with the FIRST line of a two-line row automatically. The old
+     flex + align-items:center floated the glyph to the vertical middle of a
+     wrapped row. */
   #legend-body .row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 5px 0;
-    line-height: 1.3;
+    display: grid;
+    grid-template-columns: 20px 1fr;
+    gap: 9px;
+    align-items: start;
+    margin: 7px 0;
+    line-height: 1.5;
   }
+  #legend-body .glyph {
+    text-align: center;
+    line-height: inherit;
+  }
+  /* The loop-holder swatch is a dot, so it needs a real 1:1 box (the old rule
+     was 18x12, i.e. an ellipse) nudged onto the first text line. */
   #legend-body .sw {
-    flex: 0 0 18px;
-    height: 12px;
-    border-radius: 2px;
-    display: inline-block;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    justify-self: center;
+    margin-top: 3px;
+    background: hsl(210, 80%, 70%);
+    box-shadow: 0 0 6px hsl(210, 90%, 70%);
   }
-  #legend-body .glyph { flex: 0 0 18px; text-align: center; }
+  #legend-body b { color: #e6edf3; }
+  #legend-body code {
+    background: #21262d;
+    border-radius: 3px;
+    padding: 0 3px;
+    font-size: 10px;
+  }
+
+  /* --- Inspector body ----------------------------------------------------- */
+  #inspector-body { padding: 7px 11px 9px; }
+  #inspector-body .irow {
+    display: grid;
+    grid-template-columns: 88px 1fr;
+    gap: 9px;
+    align-items: start;
+    margin: 4px 0;
+    line-height: 1.45;
+  }
+  #inspector-body .ik { color: #8b949e; }
+  #inspector-body .iv { color: #e6edf3; font-family: monospace; word-break: break-all; }
+  #inspector-body .bad { color: #f85149; }
+  #inspector-body .warn { color: #d29922; }
+  /* Trace ids are meant to be copied out into a log search. */
+  #inspector-body .sel { user-select: all; }
 </style>
 </head>
 <body>
@@ -165,6 +275,14 @@
       <label for="ld-maxreq">max req:</label>
       <input id="ld-maxreq" type="number" value="10" min="1" max="50" title="max concurrent requests shown as rows">
     </span>
+    <span id="ld-slow-wrap">
+      <label for="ld-slow">slow req:</label>
+      <input id="ld-slow" type="number" value="500" min="1" max="60000" step="50" title="requests slower than this (ms) get an amber outcome tag and match slow:true">ms
+    </span>
+    <span id="ld-filter-wrap">
+      <label for="ld-filter">filter:</label>
+      <input id="ld-filter" type="text" placeholder="path:/async zone:threadpool slow:true" title="space-separated terms, ANDed: path:X · status:N · slow:true · zone:loop|threadpool. A bare word matches the path or trace id. Display-only — it never hides events, just rows.">
+    </span>
     <span id="ld-step-wrap">
       <label for="ld-step"><input id="ld-step" type="checkbox"> step</label>
       <button id="ld-step-btn" disabled title="apply buffered events until the loop hands off or a request finishes">▶ step</button>
@@ -172,26 +290,40 @@
     <button id="ld-clear" title="remove all requests currently shown (finished ones no longer disappear on their own)">clear</button>
   </div>
 </header>
+<main id="stage">
 <canvas id="viz"></canvas>
-<div id="legend">
-  <div id="legend-head">
-    <b>What am I looking at?</b>
-    <button id="legend-toggle" title="minimize / expand">–</button>
+<div id="overlays">
+  <div id="legend">
+    <div id="legend-head">
+      <b>What am I looking at?</b>
+      <button id="legend-toggle" title="minimize / expand">&ndash;</button>
+    </div>
+    <div id="legend-body">
+      <p class="lead"><b>Two zones.</b> <b>EVENT LOOP</b> (top) is one thread &mdash;
+      only ONE async request runs at a time, the rest wait at an <code>await</code>.
+      <b>THREADPOOL</b> (bottom) is sync endpoints on worker threads, where several
+      truly run at once.</p>
+      <div class="row"><span class="glyph" style="color:#3fb950">&#9679;</span><span class="txt"><b>RUNNING</b> &mdash; executing right now (on the loop, or on a worker)</span></div>
+      <div class="row"><span class="glyph" style="color:#8b949e">&#9675;</span><span class="txt"><b>WAITING</b> &mdash; parked at an <code>await</code></span></div>
+      <div class="row"><span class="glyph" style="color:#d29922">&#8943;</span><span class="txt"><b>UNTRACED</b> &mdash; the loop is in library code outside your roots, so we can't see it</span></div>
+      <div class="row"><span class="glyph" style="color:#6e7681">&#10003;</span><span class="txt"><b>DONE</b> &mdash; request finished (stays until you clear)</span></div>
+      <div class="row"><span class="glyph" style="color:#f85149">&#128293;</span><span class="txt"><b>BLOCKED</b> &mdash; sync/CPU work in an <code>async</code> path, freezing the loop</span></div>
+      <div class="row"><span class="sw"></span><span class="txt">glowing spine dot = which request <b>holds</b> the loop</span></div>
+      <div class="row"><span class="glyph" style="color:#8b949e">#</span><span class="txt">each request's short id &mdash; one row = one request</span></div>
+      <div class="row"><span class="glyph" style="color:#8b949e">&middot;</span><span class="txt"><b>200 &middot; 42ms</b> = status &amp; duration; amber = slow, red = 5xx or raised</span></div>
+      <div class="row"><span class="glyph" style="color:#79c0ff">&#9643;</span><span class="txt">hover a call to outline that <b>same function</b> in every row</span></div>
+      <div class="row"><span class="glyph" style="color:#58a6ff">&#9613;</span><span class="txt">click a row to <b>inspect</b> it (panel below) and expand its tree</span></div>
+    </div>
   </div>
-  <div id="legend-body">
-    <p class="lead">Two zones. <b>EVENT LOOP</b> (top) = one thread, only ONE
-    async request runs at a time; the rest wait at an <code>await</code>.
-    <b>THREADPOOL</b> (bottom) = sync endpoints on worker threads, several
-    truly run at once.</p>
-    <div class="row"><span class="glyph" style="color:#3fb950">●</span> <b>RUNNING</b> — executing right now (on the loop, or on a worker)</div>
-    <div class="row"><span class="glyph" style="color:#8b949e">○</span> <b>WAITING</b> — parked at an <code>await</code></div>
-    <div class="row"><span class="glyph" style="color:#d29922">⋯</span> <b>UNTRACED</b> — loop is in library code outside your roots (can't see it)</div>
-    <div class="row"><span class="glyph" style="color:#6e7681">✓</span> <b>DONE</b> — request finished (stays until you clear)</div>
-    <div class="row"><span class="glyph" style="color:#f85149">🔥</span> <b>BLOCKED</b> — sync/CPU work in an <code>async</code> path freezing the loop</div>
-    <div class="row"><span class="sw" style="background:hsl(210,80%,70%);box-shadow:0 0 6px hsl(210,90%,70%);border-radius:50%"></span> glowing spine dot = which request <b>holds</b> the loop</div>
-    <div class="row"><span class="glyph" style="color:#8b949e">#</span> id = each request's short id · a row = one request</div>
+  <div id="inspector" hidden>
+    <div id="inspector-head">
+      <b id="inspector-title">request</b>
+      <button id="inspector-toggle" title="minimize / expand">&ndash;</button>
+    </div>
+    <div id="inspector-body"></div>
   </div>
 </div>
+</main>
 <script src="./dashboard.js"></script>
 </body>
 </html>

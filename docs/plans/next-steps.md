@@ -14,6 +14,12 @@ curl, httpx, a load tool). Do not reintroduce any API-calling control.
 
 ## Definition of Done — v0.1.0
 
+**Status:** everything below holds EXCEPT the three marked ✗ — task 9's
+multi-worker *banner* (the limitation is documented in `README.md` and
+`docs/architecture.md`, but nothing detects the case at runtime), task 12's auth
+token, and CI + the README screenshot from 13A. Do not tag `v0.1.0` until those
+land.
+
 Tag `v0.1.0` only when ALL of these hold:
 
 - async-generator dependencies (`async def ... yield`, e.g. `get_db`) are
@@ -27,10 +33,13 @@ Tag `v0.1.0` only when ALL of these hold:
 - child-task trace propagation is tested (task 1);
 - events carry monotonic sequence numbers and event loss is detectable (task 15);
 - loop state distinguishes running / waiting / untraced / done (task 4);
-- the visualizer is disabled by default outside debug mode (task 7);
-- the multi-worker limitation is clearly surfaced (task 9);
-- `uv run pytest` passes and CI passes on 3.12/3.13/3.14 (tasks 1, 13A);
-- README documents installation + limitations, with a screenshot/GIF (13A).
+- the visualizer is disabled by default outside debug mode (task 7) — **done**;
+- the multi-worker limitation is clearly surfaced (task 9) — **✗ documented
+  only, no runtime banner**;
+- `uv run pytest` passes and CI passes on 3.12/3.13/3.14 (tasks 1, 13A) —
+  **✗ pytest passes (29 tests); CI not set up**;
+- README documents installation + limitations, with a screenshot/GIF (13A) —
+  **✗ documented, no screenshot/GIF yet**.
 
 PyPI publishing (13B) is explicitly NOT part of v0.1.0 — see Phase 5.
 
@@ -39,12 +48,14 @@ PyPI publishing (13B) is explicitly NOT part of v0.1.0 — see Phase 5.
 ## Execution roadmap (phases)
 
 - **Phase 1 — Correctness (make the existing system trustworthy):**
-  6 → 1 → 15 → 5 → 4
-- **Phase 2 — Teaching feature:** 3
+  6 → 1 → 15 → 5 → 4 — **DONE**
+- **Phase 2 — Teaching feature:** 3 — **DONE**
 - **Phase 3 — Safety (safe to hand to another dev):** 7 (incl. former 8) → 9 → 12
-- **Phase 4 — Adoptable + release:** 13A → 2
+  — **7 DONE; 9 and 12 deliberately deferred**, so this phase is NOT closed.
+- **Phase 4 — Adoptable + release:** 13A → 2 — blocked (see Definition of Done)
 - **Phase 5 — Perf / config / polish (only after the model is proven):**
-  10 → 11 → 14 → 17 → 18 → 19 → 13B
+  10 → 11 → 14 → 17 → 18 → 19 → 13B — **14 DONE** (pulled forward, out of
+  phase order, because it needed nothing from 10/11); rest open.
 
 Rationale: task 6 is a real classification bug AND a prerequisite for task 5's
 zone split, so it's first. Tests (1) come immediately after so every later
@@ -239,7 +250,16 @@ is detected client-side and banners; a test asserts monotonic ordering.
 
 # Phase 2 — Teaching feature
 
-## 3. Blocking detection (original milestone 3)
+## 3. Blocking detection (original milestone 3) — **DONE**
+
+Shipped as designed: retrospective per-interval measurement in `monitor.py`
+(`_loop_open`/`_loop_close`), `loop_blocked`/`loop_unblocked` stamped at the real
+span boundaries, `slow_ms` threshold on `visualize()`, red spine flash + node
+glow + a durable per-row "🔥 blocked" tag, and a `/blocking` demo endpoint.
+Building it also flushed out four unrelated bugs — see the changelog's Fixed
+section (collector thread-safety, spurious drop banner, over-cap traces never
+reappearing, step mode stalling on threadpool traffic, Ctrl+C needing two
+presses).
 
 Surface the key teaching failure: sync/CPU work inside an `async def` that
 freezes the whole loop.
@@ -284,7 +304,13 @@ Files: `events.py`, `monitor.py` (or a timing helper), `app.py` (threshold),
 
 # Phase 3 — Safety
 
-## 7. Production safety (merges former 7 + 8) ★
+## 7. Production safety (merges former 7 + 8) ★ — **DONE**
+
+Shipped: `enabled=` resolved before anything is touched (explicit > `FASTAPI_VIZ`
+> `app.debug`); when off, nothing is installed or mounted and
+`app.state._viz == {"enabled": False}`; `loop.set_debug(True)` removed entirely
+(blocking detection never needed it). Tests in `tests/test_enable.py`; the suite
+opts in via an autouse fixture in `tests/conftest.py`.
 
 One contract: **never silently alter production/application behavior, and don't
 expose internals unless explicitly enabled.**
@@ -391,14 +417,27 @@ figure under load; benchmark numbers recorded before/after.
 Don't add all args at once. **Core** args already arrive with their features:
 `roots` (done), `path="/_viz"` (remount), `enabled` (task 7). This task adds
 the **remaining** knobs once their features exist: `sample` (task 10),
-`slow_ms` (task 3), `token` (task 12) — so `app.py` doesn't become a dumping
-ground. Also improve `roots` defaulting for `src/` layouts / multi-package
+`slow_ms` (task 3 — **done**), `token` (task 12) — so `app.py` doesn't become a
+dumping ground.
+
+**Core args landed:** `roots`, `slow_ms`, `enabled`, `path` (remount —
+normalized, root mount rejected, frontend derives its socket URL from
+`location.pathname`), plus `correlate_request_id` / `expose_request_id` from
+task 14. Still open here: `sample` (needs task 10), `token` (needs task 12), and
+the better `roots` defaulting for `src/` layouts. Also improve `roots` defaulting for `src/` layouts / multi-package
 repos (walk to nearest package root, or accept package names).
 
 Files: `app.py`, `monitor.py`, `README.md`.
 **Done-check:** each arg takes effect; `path="/debug/viz"` remounts there.
 
-## 14. Feature polish (nice-to-have)
+## 14. Feature polish (nice-to-have) — **DONE** (all 7 sub-items)
+
+Shipped: duration + status code (via an ASGI `send` wrapper, no body
+buffering) on `request_end.extra`; request inspector as a DOM overlay opened by
+a row click; trace ids widened to `token_hex(8)` with a 6-char row display;
+`path:`/`status:`/`slow:`/`zone:` row filter; hover-to-highlight the same
+qualname across rows; `correlate_request_id` + `expose_request_id`. Tests in
+`tests/test_request_meta.py`.
 
 - **Request duration:** derive `wall = request_end.t - request_start.t`
   (timestamps already monotonic). Show next to each request; flag/color slow
@@ -453,7 +492,17 @@ Files: `static/*`.
 **Done-check:** dashboard still works offline; state/reducer logic is importable
 in isolation.
 
-## 19. Deterministic frontend event-replay tests
+## 19. Deterministic frontend event-replay tests — **STARTED**
+
+A first slice exists: `tests/js/playback_test.js` loads the real `dashboard.js`
+under a stubbed DOM and drives it via a fake WebSocket + fake rAF clock,
+asserting on what reaches the graph (observed through the `#event-count`
+element that `ingest()` updates). It caught and now guards the auto-playback
+stall. Notably this did NOT require task 18 first — driving the IIFE from
+outside works without exports, so 18 is an optional cleanup here, not a
+prerequisite. Still to cover: seq gaps (15), multiple tasks per trace (17),
+offload events, blocking warnings (3), and duplicate/out-of-order events.
+Runner: `tests/test_dashboard_playback.py`, which skips when node is absent.
 
 Once task 18 makes the reducer pure, feed it fixed event sequences and assert
 resulting state — no browser needed. Example fixture

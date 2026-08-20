@@ -8,6 +8,49 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Configurable dashboard path** (Phase 5, plan task 11 — core arg):
+  `visualize(app, path="/debug/viz")` moves the page, script and WebSocket
+  together. Leading/trailing slashes are optional; `path="/"` raises
+  `ValueError` instead of shadowing the app's own routes. `dashboard.js` now
+  derives its socket URL from `location.pathname` rather than hardcoding
+  `/_viz/ws`, so a custom mount needs no frontend change, no templating and no
+  build step.
+- **Opt-in enable gate** (Phase 3, plan task 7): `visualize(app, enabled=None)`.
+  Default is auto — on when `FASTAPI_VIZ=1` is set or `app.debug` is true, off
+  otherwise. When off, *nothing* is installed and nothing is mounted: no
+  monitoring, no task factory, no threadpool poller, no middleware, no `/_viz`
+  route. `app.state._viz` becomes `{"enabled": False}` and one line is printed
+  explaining how to enable. This makes it safe to leave `visualize(app)` in an
+  app that ships to production. Note the gate is about not installing
+  uninvited, not access control — when enabled, `/_viz` is still
+  unauthenticated (plan task 12, not done).
+- **Request outcome: status code + duration** (Phase 5, plan task 14).
+  `TraceMiddleware` wraps the ASGI `send` callable to read `status` off
+  `http.response.start` — without touching or buffering response bodies — and
+  stamps `request_end.extra` with `status`, `duration_ms`, and `error` (the
+  exception class name) when the app raised. Application exceptions are
+  re-raised, never swallowed. Each finished row shows `200 · 42ms`, amber past
+  the new `slow req` threshold control (default 500ms), red for a 5xx or a
+  raised exception.
+- **Request inspector** (Phase 5, plan task 14): clicking a row opens a panel
+  with the full trace id (selectable, for pasting into a log search), any
+  inbound `X-Request-ID`, status, duration, execution zone, asyncio task count,
+  call-node count, suspension count, and blocking spans. Implemented as a DOM
+  overlay rather than canvas drawing so the ids are real selectable text.
+- **Row filter** (Phase 5, plan task 14): header filter box taking
+  space-separated ANDed terms — `path:/checkout`, `status:500`, `slow:true`,
+  `zone:loop`/`zone:threadpool` — plus bare substrings matched against path and
+  trace id. Display-only: it never changes what is recorded or which traces get
+  a row.
+- **Cross-request qualname highlight** (Phase 5, plan task 14): hovering a call
+  node outlines that same function in every other row, showing where a shared
+  helper is running across concurrent requests.
+- **X-Request-ID correlation** (Phase 5, plan task 14): an inbound header is
+  always recorded on `request_start` and shown in the inspector, and becomes the
+  trace id only when `correlate_request_id=True` (filtered to `[A-Za-z0-9._-]`,
+  truncated to 64 chars — a client must not be able to choose its own id
+  unasked). `expose_request_id=True` sends the trace id back as an
+  `x-request-id` response header; default off.
 - **Blocking detection** (Phase 2, plan task 3): sync/CPU work inside a
   coroutine (`time.sleep`, a tight loop, a blocking driver call) freezes the
   single loop thread and stalls every other request — the classic async
@@ -31,6 +74,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   it sees a gap (the bounded server buffer shed events), surfaces a
   "⚠ N events dropped — some traces may be incomplete" banner instead of
   silently reconstructing an impossible tree.
+- **Frontend replay tests** (a first slice of Phase 5, plan task 19):
+  `tests/js/playback_test.js` loads the real `dashboard.js` under a stubbed DOM
+  and drives it through a fake WebSocket and a fake `requestAnimationFrame`
+  clock, asserting on the events that actually reach the graph. It does not need
+  the task-18 module split to work. `tests/test_dashboard_playback.py` runs it
+  from pytest and **skips** when node is absent, so node stays an optional tool
+  rather than a new dev dependency.
 - **Backend regression net** (Phase 1, plan task 1): `tests/test_monitor.py` +
   shared `tests/conftest.py` fixture cover async-generator vs sync-def
   classification, custom-lifespan install, fail-soft on monitoring
@@ -77,6 +127,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Requests now appear automatically; auto-playback was completely stalled.**
+  `render()` runs from page load, so `advancePlayback()` reached its idle branch
+  long before any event existed — where `maxSeenT` is still `0` and `virtualT`
+  is `null`. It set `virtualT = 0`, which made the clock non-null and
+  permanently skipped the "begin near live" initialization below it. When a
+  request finally arrived, the clock was ~500,000 server-seconds behind (server
+  timestamps are `time.monotonic()`, i.e. seconds since boot), got clamped to
+  `maxSeenT - MAX_LAG`, and then had to creep 20 server-seconds at the playback
+  speed — 100 seconds of real time at the default 0.2x — before a single event
+  rendered. The same flaw stalled every idle gap between bursts. Step mode
+  appeared to be the only thing that worked because `doStep()` bypasses this
+  clock entirely. The clock now jumps to the oldest buffered event whenever it
+  is behind it, which collapses both the startup gap and every gap between
+  bursts; `INIT_LOOKBACK` is gone (the on-connect backlog is already dropped
+  outright, so it guarded nothing). Covered by `tests/js/playback_test.js`.
 - **Offloaded sync requests no longer hang RUNNING forever in the live view.**
   `Collector.push()` fanned events out to subscriber `asyncio.Queue`s with a
   bare `put_nowait`. That is not thread-safe: a sync endpoint's
@@ -131,6 +196,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Overlay panels share one right-side column.** The legend and the request
+  inspector now live in a flex column pinned to the right edge — legend at the
+  top, inspector at the bottom (it moved from bottom-left). Each shrinks into
+  its own scroll rather than overlapping the other on a short window, and the
+  column is `pointer-events: none` so the strip between them no longer swallows
+  canvas clicks and wheel scrolling.
+- **Legend rows lay out correctly.** Each row's description is now wrapped in a
+  single element, so `<b>`/`<code>` inside it no longer become sibling
+  flex/grid items competing for their own columns (the cause of the ragged
+  alignment). Rows are a 2-column grid, so a glyph lines up with the FIRST line
+  of a wrapped row instead of floating to its vertical middle; the loop-holder
+  swatch is a real circle instead of an 18×12 ellipse.
+- **`loop.set_debug(True)` is no longer set** (Phase 3, plan task 7). It changed
+  the host app's behavior (slow-callback logging, coroutine origin tracking) and
+  cost overhead for every visualized app. Blocking detection never needed it —
+  `monitor.py` times wall clock between `sys.monitoring` boundaries itself.
+- **Trace ids widened to 16 hex chars** (`secrets.token_hex(8)`, was
+  `token_hex(3)`) so concurrent requests don't collide under real load. Rows
+  display a 6-char prefix; the inspector shows the full id.
+- **A row click now also selects the request** for the inspector, in addition to
+  expanding/collapsing its call tree.
 - **Two execution zones** (Phase 1, plan task 5): the dashboard now splits into
   a top EVENT LOOP zone (async requests, one-runs-at-a-time, holder glow) and a
   bottom THREADPOOL zone (sync/offloaded requests, several run in parallel),

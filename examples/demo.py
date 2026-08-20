@@ -71,4 +71,7 @@ async def root():
     return {"open": "/_viz"}
 
 
-visualize(app)
+# enabled=True: since task 7 the visualizer installs nothing unless app.debug
+# is set or FASTAPI_VIZ=1 is exported. The demo opts in explicitly so it works
+# straight from `uv run uvicorn examples.demo:app`.
+visualize(app, enabled=True)
