@@ -360,4 +360,11 @@ disables tracing (no leaked callbacks or DISABLE state).
   safe because AnyIO runs one offloaded call per worker thread at a time — it
   does not unify the stack across the sync/async boundary of a single
   request.
+- **Multi-worker processes each have their own in-memory collector.**
+  `uvicorn --workers N` or gunicorn forks N separate processes; `/_viz` is
+  served by whichever worker handles that request, and the ring buffer is
+  per-process. Traffic handled by other workers is invisible. The dashboard
+  surfaces this with a header banner when `WEB_CONCURRENCY` or
+  `UVICORN_WORKERS` > 1 is detected. **Recommendation:** run a single worker
+  (`uvicorn examples.demo:app`) during development.
 

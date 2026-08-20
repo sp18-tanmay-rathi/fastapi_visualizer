@@ -100,6 +100,8 @@
   var eventCountEl = document.getElementById("event-count");
   var dropWarnEl = document.getElementById("drop-warn");
   var dropCountEl = document.getElementById("drop-count");
+  var multiWorkerWarnEl = document.getElementById("multi-worker-warn");
+  var workerPidEl = document.getElementById("worker-pid");
 
   var eventCount = 0;
 
@@ -1657,6 +1659,13 @@
           // First frame IS the backlog snapshot. Set the live edge to its
           // newest timestamp and drop it; only newer events get animated.
           sawFirstFrame = true;
+          try {
+            var meta = frame.meta;
+            if (meta && meta.multi_worker) {
+              if (multiWorkerWarnEl) multiWorkerWarnEl.hidden = false;
+              if (workerPidEl) workerPidEl.textContent = String(meta.worker_pid || "?");
+            }
+          } catch (e) { /* ignore */ }
           for (var k = 0; k < frame.events.length; k++) {
             if (frame.events[k].t > connectBaselineT) connectBaselineT = frame.events[k].t;
           }

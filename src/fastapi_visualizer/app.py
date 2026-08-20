@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -65,6 +66,9 @@ def _normalize_mount_path(path: str) -> str:
     return normalized
 
 
+_log = logging.getLogger(__name__)
+
+
 def _default_roots() -> list[str]:
     """Directory of the module that called visualize(), as a trace root."""
     try:
@@ -74,6 +78,21 @@ def _default_roots() -> list[str]:
     except Exception:
         pass
     return []
+
+
+def _is_multi_worker() -> bool:
+    """True when env signals multiple worker processes.
+
+    Checks WEB_CONCURRENCY (set by gunicorn, Heroku, Railway) and
+    UVICORN_WORKERS. Fail-soft: bad/missing values → False.
+    """
+    for key in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        try:
+            if int(os.environ.get(key, "1")) > 1:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
 
 
 def _mount_dashboard(app, path: str) -> None:
@@ -111,7 +130,13 @@ def _mount_dashboard(app, path: str) -> None:
         reader = asyncio.create_task(wait_disconnect())
         try:
             backlog = [e.to_dict() for e in collector.snapshot()]
-            await websocket.send_json({"events": backlog})
+            await websocket.send_json({
+                "events": backlog,
+                "meta": {
+                    "worker_pid": os.getpid(),
+                    "multi_worker": _is_multi_worker(),
+                },
+            })
             while not reader.done():
                 getter = asyncio.create_task(queue.get())
                 done, _ = await asyncio.wait(
@@ -240,6 +265,16 @@ def visualize(
             task, stop_event = threadpool.start(loop)
             state["poll_task"] = task
             state["stop_event"] = stop_event
+        except Exception:
+            pass
+        try:
+            if _is_multi_worker():
+                _log.warning(
+                    "fastapi-visualizer: running under multiple workers "
+                    "(PID %d) — dashboard shows only THIS worker's traffic. "
+                    "Run a single worker to see all requests.",
+                    os.getpid(),
+                )
         except Exception:
             pass
 

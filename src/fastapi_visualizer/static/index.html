@@ -87,6 +87,15 @@
     color: #f0883e;
     font-family: monospace;
   }
+  #multi-worker-warn {
+    font-size: 12px;
+    color: #d29922;
+    font-family: monospace;
+    background: rgba(210, 153, 34, 0.1);
+    border: 1px solid rgba(210, 153, 34, 0.3);
+    border-radius: 4px;
+    padding: 2px 8px;
+  }
   #status .dot {
     display: inline-block;
     width: 8px;
@@ -265,6 +274,7 @@
   <h1>FastAPI Async Visualizer</h1>
   <div id="status"><span class="dot"></span><span id="status-text">disconnected</span> &middot; <span id="event-count">0</span> events</div>
   <div id="drop-warn" hidden title="the event stream is bounded; under heavy load the server sheds events, so some traces on screen may be incomplete">⚠ <span id="drop-count">0</span> events dropped — some traces may be incomplete</div>
+  <div id="multi-worker-warn" hidden title="each worker has its own in-memory collector — only this worker's traffic is visible; run a single worker to see all requests">⚠ worker <span id="worker-pid"></span> of multiple — showing only this worker's traffic · run single worker to see all</div>
   <div id="load">
     <span id="ld-speed-wrap">
       <label for="ld-speed">speed:</label>

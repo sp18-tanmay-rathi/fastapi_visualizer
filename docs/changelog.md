@@ -8,6 +8,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Multi-worker awareness** (Phase 3, plan task 9): when `WEB_CONCURRENCY`
+  or `UVICORN_WORKERS` is > 1, the visualizer logs a startup warning and the
+  dashboard shows a persistent header banner — "⚠ worker PID of multiple —
+  showing only this worker's traffic · run single worker to see all". The
+  in-memory `Collector` is per-process; each uvicorn/gunicorn worker only sees
+  its own traffic. The banner makes this limitation explicit rather than silently
+  showing incomplete data. New `meta` key in the first WebSocket frame carries
+  `{worker_pid, multi_worker}` for the client to act on.
 - **Configurable dashboard path** (Phase 5, plan task 11 — core arg):
   `visualize(app, path="/debug/viz")` moves the page, script and WebSocket
   together. Leading/trailing slashes are optional; `path="/"` raises
