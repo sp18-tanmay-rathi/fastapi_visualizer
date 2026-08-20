@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +21,53 @@ from .monitor import Monitor
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+ENV_FLAG = "FASTAPI_VIZ"
+_ENV_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _resolve_enabled(app, enabled: bool | None) -> bool:
+    """Decide whether to install anything at all.
+
+    An explicit `enabled=` always wins. Otherwise this is a DEV tool, so it
+    turns itself on only where a dev-environment signal exists: the FASTAPI_VIZ env flag
+    or the app's own debug mode. Default-off matters because installing means
+    global sys.monitoring callbacks, a wrapped task factory, a polling task and
+    an unauthenticated /_viz mount — none of which should appear in production
+    just because the import is still there.
+    """
+    if enabled is not None:
+        return bool(enabled)
+    try:
+        env = os.environ.get(ENV_FLAG, "").strip().lower()
+    except Exception:
+        env = ""
+    if env in _ENV_TRUTHY:
+        return True
+    try:
+        return bool(getattr(app, "debug", False))
+    except Exception:
+        return False
+
+
+def _normalize_mount_path(path: str) -> str:
+    """Normalize the dashboard mount path to a leading slash, no trailing one.
+
+    Accepts "/_viz", "_viz", "/debug/viz/" alike. Raises on a root mount: that
+    would shadow the application's own routes, which is a config mistake worth
+    failing loudly on rather than silently breaking the app the tool is
+    supposed to be observing.
+    """
+    normalized = "/" + str(path).strip().strip("/")
+    if normalized == "/":
+        raise ValueError(
+            "fastapi_visualizer: path must not be '/' or empty — mounting the "
+            "dashboard at the root would shadow the application's own routes"
+        )
+    return normalized
+
+
+_log = logging.getLogger(__name__)
+
 
 def _default_roots() -> list[str]:
     """Directory of the module that called visualize(), as a trace root."""
@@ -31,7 +80,22 @@ def _default_roots() -> list[str]:
     return []
 
 
-def _mount_dashboard(app) -> None:
+def _is_multi_worker() -> bool:
+    """True when env signals multiple worker processes.
+
+    Checks WEB_CONCURRENCY (set by gunicorn, Heroku, Railway) and
+    UVICORN_WORKERS. Fail-soft: bad/missing values → False.
+    """
+    for key in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        try:
+            if int(os.environ.get(key, "1")) > 1:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+def _mount_dashboard(app, path: str) -> None:
     async def index(request):
         return FileResponse(STATIC_DIR / "index.html")
 
@@ -66,7 +130,13 @@ def _mount_dashboard(app) -> None:
         reader = asyncio.create_task(wait_disconnect())
         try:
             backlog = [e.to_dict() for e in collector.snapshot()]
-            await websocket.send_json({"events": backlog})
+            await websocket.send_json({
+                "events": backlog,
+                "meta": {
+                    "worker_pid": os.getpid(),
+                    "multi_worker": _is_multi_worker(),
+                },
+            })
             while not reader.done():
                 getter = asyncio.create_task(queue.get())
                 done, _ = await asyncio.wait(
@@ -98,10 +168,56 @@ def _mount_dashboard(app) -> None:
             WebSocketRoute("/ws", ws_endpoint),
         ]
     )
-    app.mount("/_viz", viz_app)
+    # The dashboard page and its WebSocket are siblings under this mount, and
+    # dashboard.js derives the socket URL from its own location.pathname — so
+    # nothing downstream needs to know the path we picked here.
+    app.mount(path, viz_app)
 
 
-def visualize(app, roots: list[str] | None = None, slow_ms: int = 100) -> None:
+def visualize(
+    app,
+    roots: list[str] | None = None,
+    slow_ms: int = 100,
+    enabled: bool | None = None,
+    path: str = "/_viz",
+    correlate_request_id: bool = False,
+    expose_request_id: bool = False,
+) -> None:
+    """Attach the visualizer to `app` and mount the dashboard at /_viz.
+
+    enabled:
+        None (default) = auto: on when FASTAPI_VIZ=1 or app.debug is true, off
+        otherwise. When off, NOTHING is installed and nothing is mounted, so
+        leaving the call in place is safe in production.
+    slow_ms:
+        blocking-detection threshold — an in-root loop frame running longer
+        than this without yielding is reported as a blocking span.
+    path:
+        where to mount the dashboard (default "/_viz"). Useful to avoid a
+        collision with an existing route, or to hide it behind a less
+        guessable prefix. Must not be "/".
+    correlate_request_id:
+        use an inbound X-Request-ID header as the trace id when present.
+    expose_request_id:
+        send the trace id back as an x-request-id response header.
+    """
+    # Resolve the gate FIRST: when off we must not touch the app at all.
+    if not _resolve_enabled(app, enabled):
+        try:
+            app.state._viz = {"enabled": False}
+        except Exception:
+            pass
+        print(
+            f"[fastapi_visualizer] disabled — set {ENV_FLAG}=1 or "
+            "visualize(app, enabled=True) to enable"
+        )
+        return
+
+    # Validate the mount path AFTER the enable gate: a disabled visualizer
+    # touches nothing, so a bad path surfaces the moment you turn it on rather
+    # than raising in a production process that isn't even using it.
+    path = _normalize_mount_path(path)
+
     if roots is None:
         roots = _default_roots()
     try:
@@ -110,12 +226,21 @@ def visualize(app, roots: list[str] | None = None, slow_ms: int = 100) -> None:
         roots = []
 
     try:
-        app.add_middleware(TraceMiddleware)
+        app.add_middleware(
+            TraceMiddleware,
+            correlate_request_id=correlate_request_id,
+            expose_request_id=expose_request_id,
+        )
     except Exception:
         pass
 
     monitor = Monitor(roots, slow_ms=slow_ms)
-    state = {"monitor": monitor, "poll_task": None, "stop_event": None}
+    state = {
+        "enabled": True,
+        "monitor": monitor,
+        "poll_task": None,
+        "stop_event": None,
+    }
     app.state._viz = state
 
     async def on_startup() -> None:
@@ -123,10 +248,11 @@ def visualize(app, roots: list[str] | None = None, slow_ms: int = 100) -> None:
             loop = asyncio.get_running_loop()
         except Exception:
             return
-        try:
-            loop.set_debug(True)
-        except Exception:
-            pass
+        # NOTE: deliberately NO loop.set_debug(True) here. It changes the host
+        # app's behavior (slow-callback logging, coroutine origin tracking) and
+        # costs overhead, and blocking detection does not need it — monitor.py
+        # times wall clock between sys.monitoring boundaries instead of reading
+        # asyncio's slow-callback machinery.
         try:
             identity.install_task_factory(loop)
         except Exception:
@@ -139,6 +265,16 @@ def visualize(app, roots: list[str] | None = None, slow_ms: int = 100) -> None:
             task, stop_event = threadpool.start(loop)
             state["poll_task"] = task
             state["stop_event"] = stop_event
+        except Exception:
+            pass
+        try:
+            if _is_multi_worker():
+                _log.warning(
+                    "fastapi-visualizer: running under multiple workers "
+                    "(PID %d) — dashboard shows only THIS worker's traffic. "
+                    "Run a single worker to see all requests.",
+                    os.getpid(),
+                )
         except Exception:
             pass
 
@@ -193,6 +329,6 @@ def visualize(app, roots: list[str] | None = None, slow_ms: int = 100) -> None:
             pass
 
     try:
-        _mount_dashboard(app)
+        _mount_dashboard(app, path)
     except Exception:
         pass

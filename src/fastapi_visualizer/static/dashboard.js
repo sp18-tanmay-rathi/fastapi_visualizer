@@ -83,6 +83,16 @@
   var BLOCK_FLASH_MIN_MS = 900;
   var BLOCK_FLASH_MAX_MS = 3000;
 
+  // Trace ids are 16 hex chars (identity.py widened them from 6 so they don't
+  // collide under load); a row tag shows this many characters, the inspector
+  // shows the full id.
+  var SHORT_ID_LEN = 6;
+
+  // Requests slower than this (ms) get a highlighted duration tag and match the
+  // `slow:true` filter. Header control, frontend-only: duration comes from
+  // request_end, so changing the threshold needs no server round trip.
+  var SLOW_REQ_MS = 500;
+
   var canvas = document.getElementById("viz");
   var ctx = canvas.getContext("2d");
   var statusEl = document.getElementById("status");
@@ -90,6 +100,8 @@
   var eventCountEl = document.getElementById("event-count");
   var dropWarnEl = document.getElementById("drop-warn");
   var dropCountEl = document.getElementById("drop-count");
+  var multiWorkerWarnEl = document.getElementById("multi-worker-warn");
+  var workerPidEl = document.getElementById("worker-pid");
 
   var eventCount = 0;
 
@@ -183,6 +195,20 @@
   // { traceId, node_id, qualname, duration_ms, until }
   var loopBlocked = null;
 
+  // Request selected for the inspector panel (trace_id), or null. Rendered as
+  // a DOM overlay rather than on the canvas so the trace id is selectable text.
+  var selectedTrace = null;
+  var lastInspectorPaint = 0;
+
+  // Parsed row filter (header text input). Purely a DISPLAY filter — it never
+  // affects which traces are admitted as rows (see getOrCreateBranch).
+  var filterTerms = [];
+
+  // Qualname under the cursor, for cross-request highlighting. Derived at the
+  // top of render() from the PREVIOUS frame's hoverRects (one frame of lag,
+  // imperceptible) so drawNode needs no second layout pass.
+  var hoverQual = null;
+
   // Latest threadpool sample.
   var pool = { borrowed: 0, total: POOL_DEFAULT_TOTAL, queued: 0 };
 
@@ -229,7 +255,6 @@
   var maxSeenT = 0; // newest server-time buffered so far
   var lastFrameMs = performance.now();
   var MAX_LAG = 20; // cap how far virtualT may trail newest (server seconds)
-  var INIT_LOOKBACK = 3; // on connect, start ~this many s before newest (skip stale backlog)
   var stepMode = false; // true = auto-playback paused, driven by ▶ step clicks
 
   // On connect the server sends a BACKLOG snapshot (up to 5000 past events).
@@ -261,15 +286,23 @@
 
     if (stepMode) return;
 
-    if (pending.length === 0) {
-      // Idle: collapse the gap so the next burst plays from its start, not
-      // after a long empty stretch.
-      if (virtualT === null || virtualT < maxSeenT) virtualT = maxSeenT;
-      return;
-    }
-    if (virtualT === null) {
-      // Begin near live: skip any stale backlog frame sent on connect.
-      virtualT = Math.max(pending[0].t, maxSeenT - INIT_LOOKBACK);
+    // Nothing buffered: leave the clock alone. It must NOT be seeded here —
+    // render() runs from page load, so this branch is reached long before any
+    // event exists, when maxSeenT is still 0. The old code set virtualT = 0
+    // then, which made it non-null and permanently skipped the initialization
+    // below; the clock then sat ~MAX_LAG behind the first burst and had to
+    // creep 20 server-seconds at SPEED (100s of real time at 0.2x) before a
+    // single event appeared. Auto-playback looked completely dead, and step
+    // mode "worked" only because doStep() ignores this clock.
+    if (pending.length === 0) return;
+
+    // Jump the clock to the oldest buffered event whenever it is behind it.
+    // Nothing exists between the two, so playing that stretch out in real time
+    // would be dead waiting — this is what collapses both the initial gap (page
+    // open, no traffic yet) and every idle gap BETWEEN bursts. Under continuous
+    // load virtualT is already past pending[0].t, so this is a no-op there.
+    if (virtualT === null || virtualT < pending[0].t) {
+      virtualT = pending[0].t;
     }
     virtualT += dt * SPEED;
     if (maxSeenT - virtualT > MAX_LAG) virtualT = maxSeenT - MAX_LAG;
@@ -362,6 +395,16 @@
       // just flashed for the moment. blockedMs = longest such span, for the tag.
       blocked: false,
       blockedMs: 0,
+      // --- Request outcome + inspector data (task 14) ---
+      shortId: traceId.slice(0, SHORT_ID_LEN),
+      startT: 0, // server-time of request_start (duration fallback)
+      status: null, // HTTP status, from request_end.extra
+      durationMs: null,
+      error: null, // exception class name, if the app raised
+      requestId: null, // inbound X-Request-ID, when the client sent one
+      taskIds: new Set(), // distinct asyncio tasks seen under this trace
+      suspendCount: 0,
+      blockCount: 0,
     };
     b.rootNode = {
       id: "root:" + traceId,
@@ -409,6 +452,8 @@
         b0.method = extra.method || "?";
         b0.path = extra.path || "?";
         b0.rootNode.qualname = b0.method + " " + b0.path;
+        b0.startT = ev.t;
+        if (extra.request_id) b0.requestId = extra.request_id;
         continue;
       }
 
@@ -417,6 +462,13 @@
         if (b1) {
           b1.done = true;
           b1.doneAt = ev.t;
+          // Outcome (task 14): the backend stamps status/duration_ms on
+          // request_end. Fall back to the timestamp delta when they're absent
+          // (older server, or request_start was dropped so startT is 0).
+          if (extra.status != null) b1.status = extra.status;
+          if (extra.duration_ms != null) b1.durationMs = extra.duration_ms;
+          else if (b1.startT) b1.durationMs = Math.round((ev.t - b1.startT) * 1000);
+          if (extra.error) b1.error = extra.error;
           // Grey out the request-root node too, so a finished branch reads
           // as done at a glance (persists on screen — see note above).
           b1.rootNode.state = "done";
@@ -428,6 +480,9 @@
         var b2 = getOrCreateBranch(traceId);
         if (!b2) continue;
         b2.lastEventT = ev.t;
+        // One request can span several asyncio tasks (asyncio.create_task
+        // children inherit the trace id); the inspector reports how many.
+        if (ev.task_id != null) b2.taskIds.add(ev.task_id);
         // Classify the row's zone from its request-root frame (parent_id null):
         // the backend stamps execution = "threadpool" when the frame runs on a
         // worker thread (sync def), "event_loop" otherwise (async).
@@ -478,6 +533,7 @@
         var b4 = branches.get(traceId);
         if (!b4) continue;
         b4.lastEventT = ev.t;
+        b4.suspendCount++;
         var n4 = b4.nodesById.get(extra.node_id);
         if (n4) {
           n4.state = "suspended";
@@ -513,6 +569,7 @@
           Math.max(BLOCK_FLASH_MIN_MS, Math.min(BLOCK_FLASH_MAX_MS, dur));
         if (bb) {
           bb.blocked = true; // persistent row tag (survives to DONE)
+          bb.blockCount++;
           if (dur > bb.blockedMs) bb.blockedMs = dur;
         } else {
           // Trace blocked while still over the row cap (not admitted yet).
@@ -591,11 +648,15 @@
 
   // --- Rendering ---------------------------------------------------------
 
+  // Size the drawing buffer from the canvas's ACTUAL laid-out box. The old
+  // version subtracted the header's height from the viewport, which disagreed
+  // with the CSS (a hardcoded one-row header) as soon as the header wrapped —
+  // the bitmap and the displayed box drifted apart and everything stretched.
   function resize() {
-    var header = document.querySelector("header");
-    var headerH = header ? header.offsetHeight : 0;
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight - headerH;
+    var w = canvas.clientWidth || window.innerWidth;
+    var h = canvas.clientHeight || window.innerHeight;
+    canvas.width = w;
+    canvas.height = h;
   }
   window.addEventListener("resize", resize);
   resize();
@@ -639,12 +700,13 @@
   // used by both the scrollbar and the click-to-toggle handler below.
   var currentRows = [];
 
-  // --- Click-to-expand/collapse -------------------------------------------
+  // --- Click: select for the inspector + expand/collapse -------------------
   // Hit-test: map the click's Y (already screen-space, matching
   // currentRows[i].screenTop/height which had scrollY subtracted in
-  // layoutRows) to the row it falls inside, and flip that branch's
-  // `expanded` flag. Whole-row click works, not just the "▸"/"▾" glyph —
-  // per the spec, X doesn't matter, only Y.
+  // layoutRows) to the row it falls inside. ONE gesture does both: that row
+  // becomes the inspector's subject and its call tree toggles open/closed.
+  // X doesn't matter, only Y. A click that misses every row clears the
+  // selection and closes the inspector.
   canvas.addEventListener("click", function (e) {
     var r = canvas.getBoundingClientRect();
     var clickY = e.clientY - r.top;
@@ -652,10 +714,93 @@
       var row = currentRows[i];
       if (clickY >= row.screenTop && clickY <= row.screenTop + row.height) {
         row.branch.expanded = !row.branch.expanded;
-        break;
+        selectedTrace = row.branch.traceId;
+        renderInspector();
+        return;
       }
     }
+    selectedTrace = null;
+    renderInspector();
   });
+
+  // --- Request outcome helpers (task 14) ----------------------------------
+  function isSlow(b) {
+    return b.durationMs != null && b.durationMs > SLOW_REQ_MS;
+  }
+
+  // "200 · 42ms" / "!ValueError · 12ms" / "" while still in flight.
+  function outcomeText(b) {
+    var parts = [];
+    if (b.error) parts.push("!" + b.error);
+    else if (b.status != null) parts.push(String(b.status));
+    if (b.durationMs != null) parts.push(b.durationMs + "ms");
+    return parts.join(" · ");
+  }
+
+  function outcomeColor(b) {
+    if (b.error) return "#f85149";
+    if (b.status != null && b.status >= 500) return "#f85149";
+    if (b.status != null && b.status >= 400) return "#d29922";
+    if (isSlow(b)) return "#d29922";
+    return "#8b949e";
+  }
+
+  // --- Row filter (task 14) -----------------------------------------------
+  // Space-separated terms, ANDed: `path:/checkout`, `status:500`, `slow:true`,
+  // `zone:threadpool|pool|loop`. Anything without a `key:` is a plain
+  // substring matched against the path and the trace id. Deliberately NOT a
+  // query language — keyword/substring only.
+  function parseFilter(text) {
+    var terms = [];
+    var raw = (text || "").trim().toLowerCase().split(/\s+/);
+    for (var i = 0; i < raw.length; i++) {
+      if (!raw[i]) continue;
+      var c = raw[i].indexOf(":");
+      if (c > 0) terms.push({ key: raw[i].slice(0, c), val: raw[i].slice(c + 1) });
+      else terms.push({ key: "", val: raw[i] });
+    }
+    return terms;
+  }
+
+  function matchesTerm(b, t) {
+    switch (t.key) {
+      case "path":
+        return (b.path || "").toLowerCase().indexOf(t.val) >= 0;
+      case "status":
+        return b.status != null && String(b.status) === t.val;
+      case "slow":
+        return t.val === "false" ? !isSlow(b) : isSlow(b);
+      case "zone":
+        return t.val === "loop" ? b.zone === "loop" : b.zone === "pool";
+      case "":
+        return (
+          (b.path || "").toLowerCase().indexOf(t.val) >= 0 ||
+          b.traceId.toLowerCase().indexOf(t.val) >= 0
+        );
+      default:
+        return true; // unknown key: don't silently hide everything
+    }
+  }
+
+  function matchesFilter(b) {
+    for (var i = 0; i < filterTerms.length; i++) {
+      if (!matchesTerm(b, filterTerms[i])) return false;
+    }
+    return true;
+  }
+
+  // Qualname under the cursor, read from the PREVIOUS frame's hoverRects (see
+  // the hoverQual declaration) to drive cross-request highlighting.
+  function qualnameAt(mx, my) {
+    if (mx < 0) return null;
+    for (var i = hoverRects.length - 1; i >= 0; i--) {
+      var r = hoverRects[i];
+      if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
+        return r.qualname || null;
+      }
+    }
+    return null;
+  }
 
   // Full-tree metrics (leaf count, max depth) for an EXPANDED branch. Reuses
   // assignPositions, which also stamps node._depth/_x used later by the
@@ -915,13 +1060,15 @@
     ctx.restore();
   }
 
-  function drawIdleHint() {
+  function drawIdleHint(filteredOut) {
     ctx.fillStyle = "#6e7681";
     ctx.font = "13px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(
-      "no in-flight requests — send some traffic to your app to see them here",
+      filteredOut
+        ? "every request is hidden by the current filter — clear the filter box"
+        : "no in-flight requests — send some traffic to your app to see them here",
       canvas.width / 2,
       canvas.height / 2
     );
@@ -989,6 +1136,21 @@
       ctx.lineWidth = 3;
       ctx.strokeStyle = "#ff6a5f";
       ctx.strokeRect(x - w / 2 - 3, y - h / 2 - 3, w + 6, h + 6);
+      ctx.restore();
+    }
+
+    // Cross-request qualname highlight (task 14): hovering one node outlines
+    // every frame of the SAME function in every other row, answering "where
+    // else does this run" at a glance. Thin dashed blue — visually distinct
+    // from the holder glow (solid, hue-coloured) and the blocking ring (thick
+    // red). Skipped for request roots, whose qualname is "METHOD path".
+    if (hoverQual && node.qualname === hoverQual && !node.isRoot) {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#79c0ff";
+      ctx.strokeRect(x - w / 2 - 5, y - h / 2 - 5, w + 10, h + 10);
       ctx.restore();
     }
 
@@ -1111,28 +1273,48 @@
     var y = rowY - NODE_H / 2 - 4;
     ctx.textBaseline = "bottom";
     ctx.textAlign = "left";
+    var x = ROOT_X - NODE_W / 2;
+
+    // Gutter mark on the row the inspector is currently describing.
+    if (selectedTrace === b.traceId) {
+      ctx.font = "bold 11px monospace";
+      ctx.fillStyle = "#58a6ff";
+      ctx.fillText("▍", x - 9, y);
+    }
+
+    // Short id only — trace ids are 16 hex chars now; the full one is in the
+    // inspector.
     ctx.font = "bold 11px monospace";
     ctx.fillStyle = "hsl(" + b.hue + ", 60%, 72%)";
-    var idText = "#" + b.traceId;
-    ctx.fillText(idText, ROOT_X - NODE_W / 2, y);
-    var idW = ctx.measureText(idText).width;
+    var idText = "#" + b.shortId;
+    ctx.fillText(idText, x, y);
+    x += ctx.measureText(idText).width + 10;
 
     var st = STATE_STYLE[state] || STATE_STYLE.WAITING;
     ctx.font = "10px monospace";
     ctx.fillStyle = st.color;
     var stateText = st.glyph + " " + st.label;
-    var stateX = ROOT_X - NODE_W / 2 + idW + 10;
-    ctx.fillText(stateText, stateX, y);
+    ctx.fillText(stateText, x, y);
+    x += ctx.measureText(stateText).width + 12;
+
+    // Outcome tag (task 14): "200 · 42ms", amber past the slow threshold, red
+    // for 5xx or a raised exception — so a bad or slow request reads without
+    // opening the inspector.
+    var outcome = outcomeText(b);
+    if (outcome) {
+      ctx.fillStyle = outcomeColor(b);
+      ctx.fillText(outcome, x, y);
+      x += ctx.measureText(outcome).width + 12;
+    }
 
     // Durable "blocked" tag: this request froze the loop at some point. Shown
-    // alongside the live state (e.g. "✓ DONE   🔥 blocked 0.30s"), so a
-    // finished request still records that it blocked — not just a flash.
+    // alongside the live state (e.g. "✓ DONE  200 · 302ms  🔥 blocked 0.30s"),
+    // so a finished request still records that it blocked — not just a flash.
     if (b.blocked) {
-      var sw = ctx.measureText(stateText).width;
       ctx.fillStyle = "#f85149";
       var tag = "🔥 blocked";
       if (b.blockedMs) tag += " " + (b.blockedMs / 1000).toFixed(2) + "s";
-      ctx.fillText(tag, stateX + sw + 12, y);
+      ctx.fillText(tag, x, y);
     }
 
     ctx.textBaseline = "alphabetic";
@@ -1389,14 +1571,21 @@
     // Expire the blocking flash on its real-time window (see BLOCK_FLASH_*).
     if (loopBlocked && performance.now() > loopBlocked.until) loopBlocked = null;
 
+    // Resolve the hovered qualname from LAST frame's rects, before they are
+    // cleared below — drawNode needs it while drawing THIS frame.
+    hoverQual = qualnameAt(mouseX, mouseY);
+
     ctx.fillStyle = "#0d1117";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     hoverRects = [];
 
-    // Split kept branches into the two zones (see b.zone, set in ingest()).
+    // Split kept branches into the two zones (see b.zone, set in ingest()),
+    // applying the header row filter. This is DISPLAY-only: admission to a row
+    // slot happens in getOrCreateBranch and is unaffected by the filter.
     var loopList = [];
     var poolList = [];
     branches.forEach(function (b) {
+      if (!matchesFilter(b)) return;
       (b.zone === "pool" ? poolList : loopList).push(b);
     });
 
@@ -1421,7 +1610,15 @@
 
     currentRows = lr.rows.concat(pr.rows); // shared click/scroll hit-test
 
-    if (branches.size === 0) drawIdleHint();
+    // Keep the inspector current as the selected request progresses — but not
+    // at 60fps, since it rewrites innerHTML.
+    if (selectedTrace && performance.now() - lastInspectorPaint > 200) {
+      renderInspector();
+    }
+
+    if (loopList.length === 0 && poolList.length === 0) {
+      drawIdleHint(branches.size > 0);
+    }
 
     drawTooltip();
     requestAnimationFrame(render);
@@ -1430,9 +1627,19 @@
 
   // --- WebSocket -----------------------------------------------------
 
-  function connect() {
+  // The dashboard mount path is configurable (`visualize(app, path=...)`), so
+  // the socket URL is DERIVED from the page's own location rather than
+  // hardcoding "/_viz". The page is served at the mount root and the socket is
+  // its "ws" sibling, so whatever the app mounted us at, location.pathname
+  // already reflects it — no server-side templating, no build step.
+  function wsUrl() {
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
-    var ws = new WebSocket(proto + "//" + location.host + "/_viz/ws");
+    var base = location.pathname.replace(/\/+$/, ""); // "/_viz/" -> "/_viz"
+    return proto + "//" + location.host + base + "/ws";
+  }
+
+  function connect() {
+    var ws = new WebSocket(wsUrl());
 
     ws.onopen = function () {
       statusEl.classList.add("connected");
@@ -1452,6 +1659,13 @@
           // First frame IS the backlog snapshot. Set the live edge to its
           // newest timestamp and drop it; only newer events get animated.
           sawFirstFrame = true;
+          try {
+            var meta = frame.meta;
+            if (meta && meta.multi_worker) {
+              if (multiWorkerWarnEl) multiWorkerWarnEl.hidden = false;
+              if (workerPidEl) workerPidEl.textContent = String(meta.worker_pid || "?");
+            }
+          } catch (e) { /* ignore */ }
           for (var k = 0; k < frame.events.length; k++) {
             if (frame.events[k].t > connectBaselineT) connectBaselineT = frame.events[k].t;
           }
@@ -1513,11 +1727,13 @@
       pending = [];
       loopHolder = null;
       loopBlocked = null;
+      selectedTrace = null;
       scrollLoop = 0;
       scrollPool = 0;
       droppedCount = 0;
       if (dropCountEl) dropCountEl.textContent = "0";
       if (dropWarnEl) dropWarnEl.hidden = true;
+      renderInspector();
     });
   }
 
@@ -1539,6 +1755,129 @@
       if (stepMode) doStep();
     });
   }
+
+  // "slow req (ms)": duration threshold above which a request's outcome tag
+  // goes amber and `slow:true` matches it. Frontend-only — duration arrives on
+  // request_end, so retuning the threshold needs no server round trip.
+  var slowInput = document.getElementById("ld-slow");
+  function applySlow() {
+    SLOW_REQ_MS = Math.max(1, Math.min(60000, parseInt(slowInput.value, 10) || 500));
+    renderInspector();
+  }
+  if (slowInput) {
+    slowInput.addEventListener("input", applySlow);
+    applySlow();
+  }
+
+  // Row filter box (see parseFilter/matchesFilter).
+  var filterInput = document.getElementById("ld-filter");
+  function applyFilter() {
+    filterTerms = parseFilter(filterInput.value);
+  }
+  if (filterInput) {
+    filterInput.addEventListener("input", applyFilter);
+    applyFilter();
+  }
+
+  // --- Request inspector (task 14) ----------------------------------------
+  // A DOM overlay, not canvas drawing: the trace id has to be selectable text
+  // (that's the whole point of showing it), and this keeps the canvas draw
+  // path from growing another responsibility. Repainted on selection change
+  // and at most every 200ms while the selected request is still running.
+  var inspectorEl = document.getElementById("inspector");
+  var inspectorBody = document.getElementById("inspector-body");
+  var inspectorTitle = document.getElementById("inspector-title");
+  var inspectorToggle = document.getElementById("inspector-toggle");
+  var inspectorHead = document.getElementById("inspector-head");
+
+  function esc(v) {
+    return String(v == null ? "" : v).replace(/[&<>]/g, function (c) {
+      return c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;";
+    });
+  }
+
+  function irow(label, value) {
+    return (
+      '<div class="irow"><span class="ik">' +
+      esc(label) +
+      '</span><span class="iv">' +
+      value +
+      "</span></div>"
+    );
+  }
+
+  function renderInspector() {
+    if (!inspectorEl || !inspectorBody) return;
+    lastInspectorPaint = performance.now();
+    var b = selectedTrace ? branches.get(selectedTrace) : null;
+    if (!b) {
+      inspectorEl.hidden = true;
+      return;
+    }
+    inspectorEl.hidden = false;
+    if (inspectorTitle) {
+      inspectorTitle.textContent = "#" + b.shortId + "  " + b.method + " " + b.path;
+    }
+
+    var html = "";
+    html += irow("state", esc(branchState(b)));
+    html += irow(
+      "status",
+      b.error
+        ? '<span class="bad">' + esc(b.error) + " (raised)</span>"
+        : b.status == null
+        ? "—"
+        : esc(b.status)
+    );
+    html += irow(
+      "duration",
+      b.durationMs == null
+        ? "—"
+        : esc(b.durationMs) + "ms" + (isSlow(b) ? ' <span class="warn">⚠ slow</span>' : "")
+    );
+    html += irow(
+      "zone",
+      b.zone === "pool" ? "threadpool (worker thread)" : "event loop"
+    );
+    html += irow("trace id", '<span class="sel">' + esc(b.traceId) + "</span>");
+    if (b.requestId) {
+      html += irow("x-request-id", '<span class="sel">' + esc(b.requestId) + "</span>");
+    }
+    // One request can span several asyncio tasks (create_task children inherit
+    // the trace id). A THREADPOOL row legitimately has none — offloaded sync
+    // work runs on a worker thread with no current task — so say that instead
+    // of showing a bare 0 that reads as missing data.
+    html += irow(
+      "asyncio tasks",
+      b.taskIds.size
+        ? esc(b.taskIds.size)
+        : b.zone === "pool"
+        ? "0 — worker thread"
+        : "—"
+    );
+    html += irow("call nodes", esc(b.nodesById.size));
+    html += irow("suspends", esc(b.suspendCount));
+    html += irow(
+      "blocking",
+      b.blockCount
+        ? '<span class="bad">' +
+          esc(b.blockCount) +
+          " span(s), worst " +
+          (b.blockedMs / 1000).toFixed(2) +
+          "s</span>"
+        : "none"
+    );
+    inspectorBody.innerHTML = html;
+  }
+
+  function toggleInspector(e) {
+    if (!inspectorEl) return;
+    if (e) e.stopPropagation();
+    var min = inspectorEl.classList.toggle("min");
+    if (inspectorToggle) inspectorToggle.textContent = min ? "+" : "–";
+  }
+  if (inspectorHead) inspectorHead.addEventListener("click", toggleInspector);
+  renderInspector();
 
   // Intern helper panel: minimize/expand by toggling the .min class; clicking
   // anywhere on its header bar toggles too (the whole bar is the hit target).

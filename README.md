@@ -51,7 +51,7 @@ app = FastAPI()
 async def root():
     return {"ok": True}
 
-visualize(app)
+visualize(app, enabled=True)
 ```
 
 Run your app as usual and open `http://127.0.0.1:8000/_viz`:
@@ -60,6 +60,28 @@ Run your app as usual and open `http://127.0.0.1:8000/_viz`:
 uv run uvicorn your_module:app --reload
 ```
 
+### Enabling it (important)
+
+The visualizer is **off by default**. `visualize(app)` with no other signal
+installs nothing at all — no monitoring, no task factory, no threadpool
+poller, no `/_viz` mount — and prints one line telling you how to turn it on.
+That is deliberate: it means you can leave the call in your app permanently
+without it following you into production.
+
+It turns itself on when any of these is true:
+
+| how | when to use it |
+|---|---|
+| `visualize(app, enabled=True)` | explicit; always wins |
+| `FASTAPI_VIZ=1` in the environment | per-shell / per-deploy toggle, no code change |
+| `FastAPI(debug=True)` | you already run debug mode locally |
+
+`enabled=False` forces it off even with the env flag set.
+
+Being enabled also means `/_viz` is served **unauthenticated** — anyone who can
+reach the port can see your paths and source structure. Bind to localhost or
+keep it off any shared environment.
+
 To try the **bundled demo** instead, run it from *this* repo:
 
 ```bash
@@ -67,8 +89,10 @@ uv run uvicorn examples.demo:app --reload
 ```
 
 `examples/demo.py` has an async endpoint (`/async`, a nested async call chain
-with real awaits) and a sync one (`/sync`, nested sync calls that Starlette
-offloads to the threadpool) to fire at.
+with real awaits), a sync one (`/sync`, nested sync calls that Starlette
+offloads to the threadpool), and a `/blocking` one (an `async def` doing sync
+work, which freezes the loop) to fire at. Drive a mix of all three with
+`uv run python examples/drive.py`.
 
 By default `visualize(app, roots=None)` traces only the source directory of
 the module that called it (its own package directory is always excluded).
@@ -83,16 +107,87 @@ tool) — the dashboard reflects whatever requests hit the app.
   since real interleaving happens in milliseconds.
 - **max req** — max rows kept on screen (default 10, 1–50); at the cap the
   oldest *finished* row is evicted to make room for a new live one.
+- **slow req** — duration threshold in ms (default 500); requests slower than
+  this get an amber outcome tag and match the `slow:true` filter.
+- **filter** — hide rows that don't match. Space-separated terms, all of which
+  must match: `path:/checkout`, `status:500`, `slow:true`,
+  `zone:loop`/`zone:threadpool`. A bare word is a substring match on the path
+  or the trace id. Display-only — it never changes what is recorded.
 - **step** — pause playback; each "▶ step" click advances events until the
-  loop hands off to a different request, one control transfer at a time.
+  loop hands off to a different request *or* a request finishes.
 - **clear** — wipes every displayed row.
 
-Click a row to expand/collapse its full call tree (collapsed by default to
-the active call path). Hover a node for its qualname, file:line, and await
-state. Async requests appear in the top EVENT LOOP zone (one glows = holds
-the loop), sync ones in the bottom THREADPOOL zone (several run at once). If
-the server sheds events under load, a header banner reports how many were
-dropped. The dashboard is **view-only** — it never calls your app.
+Each row is tagged with its runtime state and, once finished, its outcome —
+`200 · 42ms`, amber past the slow threshold, red for a 5xx or an unhandled
+exception.
+
+**Click a row** to open the request **inspector** (bottom-right, under the
+legend) and expand its
+call tree at the same time. The inspector shows the full trace id (selectable,
+for pasting into a log search), any inbound `X-Request-ID`, status, duration,
+execution zone, asyncio task count, call-node count, suspension count, and
+blocking spans.
+
+Hover a node for its qualname, `file:line`, and await state — and to outline
+**that same function in every other row**, which shows where a shared helper
+is running across concurrent requests. Async requests appear in the top EVENT
+LOOP zone (one glows = holds the loop), sync ones in the bottom THREADPOOL zone
+(several run at once). If the server sheds events under load, a header banner
+reports how many were dropped. The dashboard is **view-only** — it never calls
+your app.
+
+## Options
+
+```python
+visualize(
+    app,
+    roots=None,                  # dirs to trace; default = caller's directory
+    slow_ms=100,                 # loop-blocking threshold (see below)
+    enabled=None,                # None = auto (FASTAPI_VIZ=1 or app.debug)
+    path="/_viz",                # where to mount the dashboard
+    correlate_request_id=False,  # use an inbound X-Request-ID as the trace id
+    expose_request_id=False,     # send the trace id back as x-request-id
+)
+```
+
+### Changing the dashboard path
+
+`path=` moves the whole dashboard — page, script and WebSocket — anywhere you
+like, which is useful when `/_viz` collides with one of your own routes, or when
+you want it behind a less guessable prefix:
+
+```python
+visualize(app, enabled=True, path="/debug/viz")
+```
+
+Then open `http://127.0.0.1:8000/debug/viz`. Leading and trailing slashes are
+optional (`"debug/viz/"` works). `path="/"` raises `ValueError` — mounting at
+the root would shadow your app's own routes.
+
+You don't have to tell the frontend: `dashboard.js` derives its WebSocket URL
+from its own `location.pathname`, so the page and its socket stay siblings under
+whatever mount you chose. No rebuild, no config file.
+
+An inbound `X-Request-ID` is always *recorded* and shown in the inspector, so a
+dashboard row can be matched against an upstream log. It only *becomes* the
+trace id when `correlate_request_id=True` — otherwise a client could choose its
+own id. Correlated ids are filtered to `[A-Za-z0-9._-]` and truncated to 64
+characters.
+
+## Blocking detection
+
+Sync or CPU work inside an `async def` — `time.sleep`, a tight loop, a blocking
+driver call — freezes the single loop thread, so *every* other request stalls.
+The dashboard flashes the EVENT LOOP spine red with
+`🔥 BLOCKED by <qualname> (Ns)`, glows the offending node, and leaves a durable
+`🔥 blocked` tag on that request's row so a finished request still records that
+it froze the loop.
+
+The threshold is `slow_ms` (default 100): an in-root frame that holds the loop
+longer than this **without yielding** is reported. An `await` that takes a long
+time is *not* blocking — yielding is exactly what it's supposed to do. Work on
+a threadpool worker is never flagged either; that's what the threadpool is for.
+Try it with the demo's `/blocking` endpoint.
 
 ## How it works
 
@@ -135,3 +230,9 @@ See `docs/architecture.md` for the full design.
 - This is a dev tool, not built for production traffic volumes: every
   tracing path is fail-soft (never breaks a request on error), but it still
   adds overhead proportional to how much of your app is in the traced roots.
+  It is off by default for that reason — see *Enabling it* above.
+- When enabled, `/_viz` and its WebSocket are **unauthenticated**. There is no
+  token option yet, so don't enable it on anything reachable beyond localhost.
+- `uvicorn --workers N` runs N processes, each with its own loop and its own
+  in-memory buffer, so the dashboard only shows the worker that happened to
+  serve `/_viz`. Run a single worker while using it.
