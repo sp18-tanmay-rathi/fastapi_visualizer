@@ -331,14 +331,25 @@
       ingest([ev]);
       applied++;
       virtualT = ev.t;
-      // A step advances to the next CHECKPOINT, defined as either:
-      //  - a LOOP hand-off: the loop passed to a new async request, or
+      // A step advances to the next CHECKPOINT, defined as any of:
+      //  - a LOOP hand-off: the loop passed to a new async request,
+      //  - an OFFLOAD boundary: work left for / returned from a worker thread,
       //  - a REQUEST finishing (request_end).
+      //
       // Sync/threadpool work never touches loopHolder (it isn't ON the loop),
       // so hand-offs never happen for pure sync traffic — without the
       // request_end checkpoint a step would drain the whole buffer at once and
       // then look frozen. With it, each click visibly completes one request.
+      //
+      // The offload boundaries matter for the same reason. With a single
+      // request in flight there is no hand-off after the first click, so the
+      // next click used to drain straight through to request_end — applying
+      // offload_start and offload_end in ONE batch. The row moved to the
+      // threadpool zone and back within a single ingest, i.e. invisibly.
+      // Stopping on each boundary is what makes the hand-off watchable:
+      // one click sends the work to a worker, the next brings it back.
       if (loopHolder !== before && loopHolder !== null) break;
+      if (ev.kind === "offload_start" || ev.kind === "offload_end") break;
       if (ev.kind === "request_end") break;
     }
     pending = pending.slice(applied);
@@ -383,10 +394,12 @@
       done: false,
       doneAt: 0,
       expanded: false,
-      // "loop" (async, runs on the event loop) until the request-root frame's
-      // call_enter proves it's "pool" (sync, offloaded to a worker thread).
-      // Determines which zone the row lives in (task 5).
+      // Which zone the row lives in (task 5). Derived from sawLoopFrame /
+      // sawPoolFrame on every call_enter — see the note there. Defaults to
+      // "loop" until some frame classifies it.
       zone: "loop",
+      sawLoopFrame: false,
+      sawPoolFrame: false,
       // Server-time of the most recent in-root event for this trace; used to
       // decide when a loop holder has gone "untraced" (task 4).
       lastEventT: 0,
@@ -395,6 +408,18 @@
       // just flashed for the moment. blockedMs = longest such span, for the tag.
       blocked: false,
       blockedMs: 0,
+      // Durable record that this request handed work to a worker thread.
+      // The per-node "⇢ pool" stub only shows while the offloaded frame is on
+      // the active call path, so it vanishes the moment the call returns —
+      // and the row (correctly) stays in the EVENT LOOP zone. Without this the
+      // finished row shows no sign the offload ever happened.
+      offloadCount: 0,
+      offloadMs: 0,
+      // Offloads currently IN FLIGHT. While this is > 0 the request is
+      // literally executing on a worker thread, so the row moves to the
+      // THREADPOOL zone and moves back when it returns.
+      activeOffloads: 0,
+      _offloadStartT: new Map(), // node_id -> server-time of offload_start
       // --- Request outcome + inspector data (task 14) ---
       shortId: traceId.slice(0, SHORT_ID_LEN),
       startT: 0, // server-time of request_start (duration fallback)
@@ -421,6 +446,31 @@
     }
     branches.set(traceId, b);
     return b;
+  }
+
+  // Which zone a row is drawn in, recomputed whenever its situation changes.
+  //
+  // This is LIVE POSITION, not a one-time classification: while the request is
+  // actually executing on a worker thread (activeOffloads > 0) the row sits in
+  // the THREADPOOL zone, and it moves back to its home zone when the offloaded
+  // call returns. You watch the hand-off happen.
+  //
+  // "Home" is where the request lives the rest of the time: EVENT LOOP if any
+  // of its traced code ran on the loop, THREADPOOL if none ever did (a plain
+  // sync Django view / sync FastAPI endpoint, which never touches the loop).
+  //
+  // The predecessor keyed off `parent_id == null`, assuming only a request root
+  // is parentless. False: a worker thread starts with an empty stack, so the
+  // first frame offloaded onto it also reports parent_id null and masqueraded
+  // as a root. Whichever parentless frame fired last won the zone, so an async
+  // request that offloaded a DB call got stranded in THREADPOOL and never came
+  // back — the bug this replaces.
+  function updateZone(b) {
+    if (b.activeOffloads > 0) {
+      b.zone = "pool";
+      return;
+    }
+    b.zone = !b.sawLoopFrame && b.sawPoolFrame ? "pool" : "loop";
   }
 
   // --- Event ingestion ---------------------------------------------------
@@ -469,6 +519,12 @@
           if (extra.duration_ms != null) b1.durationMs = extra.duration_ms;
           else if (b1.startT) b1.durationMs = Math.round((ev.t - b1.startT) * 1000);
           if (extra.error) b1.error = extra.error;
+          // A dropped offload_end would otherwise leave activeOffloads stuck
+          // above zero and strand the finished row in THREADPOOL — exactly the
+          // failure this rewrite exists to remove. A finished request is on no
+          // worker thread by definition, so settle it in its home zone.
+          b1.activeOffloads = 0;
+          updateZone(b1);
           // Grey out the request-root node too, so a finished branch reads
           // as done at a glance (persists on screen — see note above).
           b1.rootNode.state = "done";
@@ -483,12 +539,26 @@
         // One request can span several asyncio tasks (asyncio.create_task
         // children inherit the trace id); the inspector reports how many.
         if (ev.task_id != null) b2.taskIds.add(ev.task_id);
-        // Classify the row's zone from its request-root frame (parent_id null):
-        // the backend stamps execution = "threadpool" when the frame runs on a
-        // worker thread (sync def), "event_loop" otherwise (async).
-        if (extra.parent_id == null && extra.execution) {
-          b2.zone = extra.execution === "threadpool" ? "pool" : "loop";
-        }
+        // Zone classification.
+        //
+        // This used to key off `parent_id == null`, on the assumption that only
+        // the request's root frame is parentless. That is false: a worker
+        // thread starts with an EMPTY thread-local stack, so the first frame
+        // offloaded onto it also reports parent_id null and masqueraded as a
+        // root. The zone was therefore reassigned mid-request and the row
+        // teleported between zones — an async request that offloaded a DB call
+        // ended up stranded in THREADPOOL even though it resumed on the loop.
+        // Whichever parentless frame fired last won, which is a coin flip.
+        //
+        // The rule now: a request belongs to the THREADPOOL zone only if NONE
+        // of its traced code ran on the event loop. Touching the loop at all
+        // puts it in the EVENT LOOP zone, because the loop is the contended
+        // resource this tool is about; its offloaded segments are still shown
+        // inline on the node ("⇢ pool"). This is monotonic — pool -> loop at
+        // most once, never back — so a row cannot oscillate.
+        if (extra.execution === "event_loop") b2.sawLoopFrame = true;
+        else if (extra.execution === "threadpool") b2.sawPoolFrame = true;
+        updateZone(b2);
         var parent =
           extra.parent_id == null
             ? b2.rootNode
@@ -602,6 +672,12 @@
         var b6 = branches.get(traceId);
         var n6 = b6 && b6.nodesById.get(extra.node_id);
         if (n6) n6.offloaded = true;
+        if (b6) {
+          b6.offloadCount++;
+          b6.activeOffloads++;
+          b6._offloadStartT.set(extra.node_id, ev.t);
+          updateZone(b6); // -> THREADPOOL: it is on a worker thread right now
+        }
         continue;
       }
 
@@ -609,6 +685,15 @@
         var b7 = branches.get(traceId);
         var n7 = b7 && b7.nodesById.get(extra.node_id);
         if (n7) n7.offloaded = false;
+        if (b7) {
+          var t0 = b7._offloadStartT.get(extra.node_id);
+          if (t0 != null) {
+            b7.offloadMs += Math.max(0, Math.round((ev.t - t0) * 1000));
+            b7._offloadStartT.delete(extra.node_id);
+          }
+          b7.activeOffloads = Math.max(0, b7.activeOffloads - 1);
+          updateZone(b7); // -> back home, usually the EVENT LOOP
+        }
         continue;
       }
     }
@@ -1305,6 +1390,19 @@
       ctx.fillStyle = outcomeColor(b);
       ctx.fillText(outcome, x, y);
       x += ctx.measureText(outcome).width + 12;
+    }
+
+    // Durable "⇢ pool" tag: this request handed work to a worker thread at
+    // some point. The row stays in its own zone (a request that touches the
+    // loop belongs to the loop), so this is what records the offload after the
+    // node has left the active call path. Expand the row to see which frame.
+    if (b.offloadCount) {
+      ctx.fillStyle = "hsl(30, 90%, 62%)";
+      var ptag = "⇢ pool";
+      if (b.offloadCount > 1) ptag += " ×" + b.offloadCount;
+      if (b.offloadMs) ptag += " " + b.offloadMs + "ms";
+      ctx.fillText(ptag, x, y);
+      x += ctx.measureText(ptag).width + 12;
     }
 
     // Durable "blocked" tag: this request froze the loop at some point. Shown

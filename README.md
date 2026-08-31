@@ -1,9 +1,14 @@
 # fastapi-visualizer
 
-A dev-time dashboard that shows what your FastAPI app's event loop is
-actually doing: which request currently holds the loop, which ones are
-parked at an `await`, and which sync endpoints are running on the
-threadpool — live, as a flow-graph, in your browser.
+A dev-time dashboard that shows what your app's event loop is actually
+doing: which request currently holds the loop, which ones are parked at an
+`await`, and which sync handlers are running on the threadpool — live, as a
+flow-graph, in your browser.
+
+Works with **FastAPI/Starlette** and **Django** (and any other ASGI app). The
+tracing itself is framework-agnostic — it reads the interpreter, not the
+framework — so only the way it attaches differs. See
+[Using it with Django](#using-it-with-django).
 
 It splits into two zones: an **EVENT LOOP** zone where async requests take
 turns one at a time, and a **THREADPOOL** zone where sync endpoints run on
@@ -39,7 +44,7 @@ Alternatives:
 - **PyPI** (only if/when published): then `uv add fastapi-visualizer` works
   as-is.
 
-## Quickstart
+## Quickstart (FastAPI)
 
 ```python
 from fastapi import FastAPI
@@ -60,7 +65,7 @@ Run your app as usual and open `http://127.0.0.1:8000/_viz`:
 uv run uvicorn your_module:app --reload
 ```
 
-### Enabling it (important)
+## Enabling it (important)
 
 The visualizer is **off by default**. `visualize(app)` with no other signal
 installs nothing at all — no monitoring, no task factory, no threadpool
@@ -97,6 +102,61 @@ work, which freezes the loop) to fire at. Drive a mix of all three with
 By default `visualize(app, roots=None)` traces only the source directory of
 the module that called it (its own package directory is always excluded).
 Pass `roots=[...]` to trace additional/different directories.
+
+## Using it with Django
+
+Three differences from FastAPI. Each one silently does nothing if you miss
+it — no error, just an empty or misleading dashboard.
+
+```python
+# yourproject/asgi.py
+import os
+from django.core.asgi import get_asgi_application
+from fastapi_visualizer import visualize
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "yourproject.settings")
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+application = visualize(
+    get_asgi_application(),
+    enabled=True,          # required: see below
+    roots=[BASE_DIR],      # required: see below
+)
+```
+
+**1. You must assign the result.** `visualize()` attaches to a Starlette app by
+mutating it, but a Django `ASGIHandler` has no `.add_middleware`, `.mount`,
+`.state` or `.router` to attach to — so it returns a *wrapped* ASGI app
+instead. `visualize(application)` without the assignment attaches nothing. It
+prints a reminder when this happens.
+
+**2. You must pass `roots`.** The default is the directory of the file that
+called `visualize()`. In a Django project that is `yourproject/yourproject/`
+(where `asgi.py` lives), and your apps are *siblings* of it — so the default
+traces none of your code, and requests show up with no call tree. Point it at
+the project root.
+
+**3. `enabled=True` is required.** Auto-detection reads `app.debug`, which an
+`ASGIHandler` does not have — so it stays off even with Django's own
+`DEBUG = True`. Or export `FASTAPI_VIZ=1`.
+
+Then run it under an ASGI server and open `http://127.0.0.1:8000/_viz`:
+
+```bash
+uvicorn yourproject.asgi:application --port 8000
+```
+
+**ASGI only.** `manage.py runserver` is WSGI — there is no event loop, so
+there is nothing to visualise.
+
+Sync Django views (`def`) run on a worker thread via `asgiref` and appear in
+the THREADPOOL zone; `async def` views appear in the EVENT LOOP zone. A
+request that offloads mid-flight (an `async` view awaiting `sync_to_async`)
+moves to THREADPOOL while the offloaded call runs and returns when it
+finishes.
+
+There is a bundled demo at `examples/django_demo.py`.
 
 ## Dashboard controls
 
@@ -204,7 +264,7 @@ saturation.
 
 Those events stream over a WebSocket to a canvas-based single-page app. "Who
 currently holds the loop" isn't a directly measured event — it's derived
-client-side from the stream using the fact that a standard FastAPI/uvicorn
+client-side from the stream using the fact that a standard ASGI/uvicorn
 process has exactly one event loop thread: whichever async request most
 recently entered or resumed a frame and hasn't since suspended is the one
 running. Because the tool only sees your own source, the loop can vanish into
@@ -236,3 +296,10 @@ See `docs/architecture.md` for the full design.
 - `uvicorn --workers N` runs N processes, each with its own loop and its own
   in-memory buffer, so the dashboard only shows the worker that happened to
   serve `/_viz`. Run a single worker while using it.
+- **On Django, the THREADPOOL worker-count reads `0/40` regardless of load.**
+  The poller reads AnyIO's thread limiter and Django uses `asgiref`'s own
+  executor, so no occupancy samples are produced. Rows still appear in the
+  zone correctly; only the header count is wrong.
+- If a virtualenv lives inside a traced root (`./venv`, `./.venv`), its
+  contents are excluded automatically — `roots` means your source, and
+  site-packages is never treated as app code.
