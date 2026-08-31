@@ -220,3 +220,28 @@ async def test_both_strategies_reach_the_same_dashboard():
 
     async with client_for_asgi(plain) as c:
         assert (await c.get("/_viz/")).status_code == 200
+
+
+async def test_bare_mount_path_redirects_to_trailing_slash():
+    """`/_viz` must 307 to `/_viz/`, matching Starlette's Mount.
+
+    index.html loads `./dashboard.js` relatively: served at `/_viz` the browser
+    resolves that to `/dashboard.js` and asks the wrapped app for it (a 404
+    from Django), instead of `/_viz/dashboard.js`.
+    """
+    app = visualize(plain_app, roots=[HERE], enabled=True)
+    async with client_for_asgi(app) as client:
+        r = await client.get("/_viz")  # httpx does not auto-follow
+        assert r.status_code == 307
+        assert r.headers["location"].endswith("/_viz/")
+
+        r = await client.get("/debug")  # unrelated path still falls through
+        assert r.status_code == 200
+
+
+async def test_bare_custom_path_redirects_too():
+    app = visualize(plain_app, roots=[HERE], enabled=True, path="/debug/viz")
+    async with client_for_asgi(app) as client:
+        r = await client.get("/debug/viz")
+        assert r.status_code == 307
+        assert r.headers["location"].endswith("/debug/viz/")

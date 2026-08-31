@@ -44,6 +44,31 @@ class VisualizedASGIApp:
         p = scope.get("path", "")
         return p == self.path or p.startswith(self.path + "/")
 
+    async def _redirect_to_slash(self, scope, send) -> None:
+        """307 from `/_viz` to `/_viz/`, exactly as Starlette's Mount does.
+
+        Not cosmetic: index.html loads its script with a RELATIVE
+        `src="./dashboard.js"`. Served at `/_viz` the browser resolves that
+        against `/`, asking the wrapped app for `/dashboard.js` (404 from
+        Django). Served at `/_viz/` it resolves to `/_viz/dashboard.js`.
+        The FastAPI path never hit this because Mount already redirects.
+        """
+        location = scope.get("root_path", "") + self.path + "/"
+        qs = scope.get("query_string", b"")
+        if qs:
+            location += "?" + qs.decode("latin-1", "ignore")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 307,
+                "headers": [
+                    (b"location", location.encode("latin-1", "ignore")),
+                    (b"content-length", b"0"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b""})
+
     def _sub_scope(self, scope) -> dict:
         """Re-root the scope under the mount, the way Starlette's Mount does."""
         sub = dict(scope)
@@ -97,6 +122,11 @@ class VisualizedASGIApp:
             await self._lifespan(scope, receive, send)
             return
         if scope["type"] in ("http", "websocket") and self._is_viz(scope):
+            # Bare mount path with no trailing slash: redirect first, so the
+            # page's relative asset URLs resolve under the mount.
+            if scope["type"] == "http" and scope.get("path") == self.path:
+                await self._redirect_to_slash(scope, send)
+                return
             await self.viz_app(self._sub_scope(scope), receive, send)
             return
         await self.app(scope, receive, send)
