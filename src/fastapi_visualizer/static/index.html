@@ -316,6 +316,7 @@
       <div class="row"><span class="glyph" style="color:#3fb950">&#9679;</span><span class="txt"><b>RUNNING</b> &mdash; executing right now (on the loop, or on a worker)</span></div>
       <div class="row"><span class="glyph" style="color:#8b949e">&#9675;</span><span class="txt"><b>WAITING</b> &mdash; parked at an <code>await</code></span></div>
       <div class="row"><span class="glyph" style="color:#d29922">&#8943;</span><span class="txt"><b>UNTRACED</b> &mdash; the loop is in library code outside your roots, so we can't see it</span></div>
+      <div class="row"><span class="glyph" style="color:#f0883e">&#8674;</span><span class="txt"><b>WAITING &middot; worker</b> &mdash; parked at an <code>await</code> whose work is running on a worker thread. The loop is free, exactly as for any other await; the call itself shows in THREADPOOL until it returns</span></div>
       <div class="row"><span class="glyph" style="color:#6e7681">&#10003;</span><span class="txt"><b>DONE</b> &mdash; request finished (stays until you clear)</span></div>
       <div class="row"><span class="glyph" style="color:#f85149">&#128293;</span><span class="txt"><b>BLOCKED</b> &mdash; sync/CPU work in an <code>async</code> path, freezing the loop</span></div>
       <div class="row"><span class="sw"></span><span class="txt">glowing spine dot = which request <b>holds</b> the loop</span></div>

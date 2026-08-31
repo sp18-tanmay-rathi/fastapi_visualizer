@@ -53,6 +53,7 @@
   var ROW_EXPANDED_MIN = 180; // expanded row: never smaller than this
   var ROW_EXPANDED_MAX_FRAC = 0.6; // ...nor taller than this fraction of the viewport
   var ROW_GAP = 8; // breathing room between stacked rows
+  var WORK_ROW_H = 52; // a live offloaded-call entry in the THREADPOOL zone
 
   // Two-zone layout (task 5): the canvas splits into a top EVENT LOOP zone
   // (async requests, one-runs-at-a-time) and a bottom THREADPOOL zone (sync
@@ -209,6 +210,14 @@
   // imperceptible) so drawNode needs no second layout pass.
   var hoverQual = null;
 
+  // Offloaded calls executing on a worker thread RIGHT NOW, keyed
+  // "traceId:nodeId". A request that awaits run_in_threadpool / sync_to_async
+  // does not itself move to a worker: its coroutine stays suspended on the
+  // loop while a *separate function* runs on the worker. So the work is
+  // tracked here and rendered in the THREADPOOL zone as its own entry, while
+  // the request keeps its row in the EVENT LOOP zone.
+  var activeOffloads = new Map();
+
   // Latest threadpool sample.
   var pool = { borrowed: 0, total: POOL_DEFAULT_TOTAL, queued: 0 };
 
@@ -338,7 +347,13 @@
       // so hand-offs never happen for pure sync traffic — without the
       // request_end checkpoint a step would drain the whole buffer at once and
       // then look frozen. With it, each click visibly completes one request.
+      // Offload boundaries are checkpoints too. With one request in flight
+      // there is no loop hand-off after the first click, so a step drained
+      // straight through request_end and applied offload_start and
+      // offload_end in ONE batch — the worker entry appeared and vanished
+      // within a single ingest, i.e. invisibly.
       if (loopHolder !== before && loopHolder !== null) break;
+      if (ev.kind === "offload_start" || ev.kind === "offload_end") break;
       if (ev.kind === "request_end") break;
     }
     pending = pending.slice(applied);
@@ -386,7 +401,17 @@
       // "loop" (async, runs on the event loop) until the request-root frame's
       // call_enter proves it's "pool" (sync, offloaded to a worker thread).
       // Determines which zone the row lives in (task 5).
+      // Which zone the row lives in — fixed by where the request's HANDLER
+      // runs, and never changed afterwards. See updateZone().
       zone: "loop",
+      sawLoopFrame: false,
+      sawPoolFrame: false,
+      // Offloads: how many are running right now (drives the WORKER state),
+      // and a durable record for the finished row.
+      liveOffloads: 0,
+      offloadCount: 0,
+      offloadMs: 0,
+      _offloadStartT: new Map(),
       // Server-time of the most recent in-root event for this trace; used to
       // decide when a loop holder has gone "untraced" (task 4).
       lastEventT: 0,
@@ -421,6 +446,27 @@
     }
     branches.set(traceId, b);
     return b;
+  }
+
+  // A request's zone is decided by where its HANDLER runs, and never changes.
+  //
+  //   any traced frame ran on the event loop  -> EVENT LOOP, for its whole life
+  //   none ever did                           -> THREADPOOL (a sync handler)
+  //
+  // Measured basis: `await run_in_threadpool(f)` leaves the request's coroutine
+  // SUSPENDED on the loop — its own frames only ever execute on the loop
+  // thread, and the loop stays as free as it is during `await asyncio.sleep()`
+  // (55 other callbacks served in 300ms, either way). Only `f` runs on a
+  // worker. So the request has not moved, and its row must not move; the
+  // worker's activity is shown separately (see activeOffloads).
+  //
+  // The predecessor keyed off `parent_id == null`, assuming only a request root
+  // is parentless. False: a worker thread starts with an empty stack, so the
+  // first frame offloaded onto it also reported parent_id null and looked like
+  // a root — which is how an async request that offloaded a DB call got
+  // stranded in THREADPOOL for the rest of its life.
+  function updateZone(b) {
+    b.zone = !b.sawLoopFrame && b.sawPoolFrame ? "pool" : "loop";
   }
 
   // --- Event ingestion ---------------------------------------------------
@@ -469,6 +515,13 @@
           if (extra.duration_ms != null) b1.durationMs = extra.duration_ms;
           else if (b1.startT) b1.durationMs = Math.round((ev.t - b1.startT) * 1000);
           if (extra.error) b1.error = extra.error;
+          // A dropped offload_end would otherwise leave this request looking
+          // forever busy on a worker. A finished request is on no worker.
+          b1.liveOffloads = 0;
+          b1._offloadStartT.clear();
+          activeOffloads.forEach(function (w, k) {
+            if (w.traceId === traceId) activeOffloads.delete(k);
+          });
           // Grey out the request-root node too, so a finished branch reads
           // as done at a glance (persists on screen — see note above).
           b1.rootNode.state = "done";
@@ -486,9 +539,9 @@
         // Classify the row's zone from its request-root frame (parent_id null):
         // the backend stamps execution = "threadpool" when the frame runs on a
         // worker thread (sync def), "event_loop" otherwise (async).
-        if (extra.parent_id == null && extra.execution) {
-          b2.zone = extra.execution === "threadpool" ? "pool" : "loop";
-        }
+        if (extra.execution === "event_loop") b2.sawLoopFrame = true;
+        else if (extra.execution === "threadpool") b2.sawPoolFrame = true;
+        updateZone(b2);
         var parent =
           extra.parent_id == null
             ? b2.rootNode
@@ -500,6 +553,7 @@
           file: extra.file,
           line: extra.line,
           is_async: !!extra.is_async,
+          execution: extra.execution || "event_loop",
           state: "running",
           offloaded: false,
           children: [],
@@ -507,11 +561,13 @@
         b2.nodesById.set(extra.node_id, node);
         parent.children.push(node);
         b2.stack.push(extra.node_id);
-        // Entering a frame means this trace is actively running — but only a
-        // LOOP-zone request can hold the single event loop. Pool-zone (sync,
-        // worker-thread) work runs in parallel and must never claim/steal the
-        // loop holder (task 4/5 correctness).
-        if (b2.zone === "loop") loopHolder = traceId;
+        // Entering a frame means this trace is running — but the loop holder
+        // must be judged per FRAME, not per request. A loop-zone request can
+        // contain threadpool frames (it awaited run_in_threadpool), and while
+        // that runs the request is PARKED: its coroutine is suspended and the
+        // loop is free for someone else. Keying off the branch's zone here
+        // would let a parked request claim the loop it is not on.
+        if (extra.execution === "event_loop") loopHolder = traceId;
         continue;
       }
 
@@ -556,7 +612,10 @@
           n5.state = "running";
           if (n5.awaiting) n5.awaitDone = true; // the await it was blocked on resolved
         }
-        if (b5.zone === "loop") loopHolder = traceId;
+        // Same per-frame rule as call_enter. `resume` carries no execution
+        // tag, so consult the node recorded at call_enter; default to treating
+        // it as loop work when the node is unknown (an event was shed).
+        if (!n5 || n5.execution === "event_loop") loopHolder = traceId;
         continue;
       }
 
@@ -599,12 +658,46 @@
       }
 
       if (ev.kind === "offload_start") {
+        var bo = branches.get(traceId);
+        if (bo) {
+          bo.liveOffloads++;
+          bo.offloadCount++;
+          bo._offloadStartT.set(extra.node_id, ev.t);
+          var no = bo.nodesById.get(extra.node_id);
+          // Only surface work belonging to a LOOP-zone request. For a sync
+          // handler the offloaded frame IS the request, already shown as its
+          // own row in the pool zone — a second entry would just duplicate it.
+          if (bo.zone === "loop") {
+            activeOffloads.set(traceId + ":" + extra.node_id, {
+              traceId: traceId,
+              nodeId: extra.node_id,
+              qualname: (no && no.qualname) || ev.name || "?",
+              hue: bo.hue,
+              shortId: bo.shortId,
+              startT: ev.t,
+            });
+          }
+        }
+      }
+      if (ev.kind === "offload_start") {
         var b6 = branches.get(traceId);
         var n6 = b6 && b6.nodesById.get(extra.node_id);
         if (n6) n6.offloaded = true;
         continue;
       }
 
+      if (ev.kind === "offload_end") {
+        var be = branches.get(traceId);
+        if (be) {
+          be.liveOffloads = Math.max(0, be.liveOffloads - 1);
+          var st = be._offloadStartT.get(extra.node_id);
+          if (st != null) {
+            be.offloadMs += Math.max(0, Math.round((ev.t - st) * 1000));
+            be._offloadStartT.delete(extra.node_id);
+          }
+        }
+        activeOffloads.delete(traceId + ":" + extra.node_id);
+      }
       if (ev.kind === "offload_end") {
         var b7 = branches.get(traceId);
         var n7 = b7 && b7.nodesById.get(extra.node_id);
@@ -871,6 +964,10 @@
   function branchState(b) {
     if (b.done) return "DONE";
     if (b.zone === "pool") return b.stack.length ? "RUNNING" : "WAITING";
+    // Parked at an await whose work is on a worker thread. Still WAITING as
+    // far as the loop is concerned (the loop is free either way) — but worth
+    // distinguishing from waiting on i/o, because a worker is busy for it.
+    if (b.liveOffloads > 0) return "WORKER";
     if (loopHolder === b.traceId) {
       if (virtualT !== null && b.lastEventT && virtualT - b.lastEventT > UNTRACED_AFTER) {
         return "UNTRACED";
@@ -1265,6 +1362,7 @@
     RUNNING: { glyph: "●", color: "#3fb950", label: "RUNNING" },
     WAITING: { glyph: "○", color: "#8b949e", label: "WAITING" },
     UNTRACED: { glyph: "⋯", color: "#d29922", label: "UNTRACED" },
+    WORKER: { glyph: "⇢", color: "#f0883e", label: "WAITING · worker" },
     DONE: { glyph: "✓", color: "#6e7681", label: "DONE" },
   };
 
@@ -1305,6 +1403,19 @@
       ctx.fillStyle = outcomeColor(b);
       ctx.fillText(outcome, x, y);
       x += ctx.measureText(outcome).width + 12;
+    }
+
+    // Durable "⇢ pool" tag: this request handed work to a worker thread at
+    // some point. The row never moves zones, and the pool-zone entry only
+    // exists while the call runs — so without this a finished request shows
+    // no sign it used a worker at all.
+    if (b.offloadCount) {
+      ctx.fillStyle = "hsl(30, 90%, 62%)";
+      var ptag = "⇢ pool";
+      if (b.offloadCount > 1) ptag += " ×" + b.offloadCount;
+      if (b.offloadMs) ptag += " " + b.offloadMs + "ms";
+      ctx.fillText(ptag, x, y);
+      x += ctx.measureText(ptag).width + 12;
     }
 
     // Durable "blocked" tag: this request froze the loop at some point. Shown
@@ -1460,6 +1571,62 @@
     if (rootPos) drawExpandArrow(rootPos.x, rootPos.y, scale, true);
   }
 
+  // One offloaded call currently executing on a worker thread. This is NOT a
+  // request — the owning request is parked on the event loop and keeps its row
+  // there. This is the unit of work the worker runs on its behalf, so it is
+  // labelled with the owner's #id and drawn in the owner's hue.
+  function drawWorkRow(item, spine, rowY) {
+    var w = NODE_W;
+    var h = NODE_H;
+    var x = ROOT_X;
+
+    drawEdge(spine.x, rowY, x - w / 2, rowY, "hsl(30, 90%, 60%)", 0.9, true, 1.5);
+
+    ctx.save();
+    ctx.fillStyle = "hsl(" + item.hue + ", 55%, 26%)";
+    ctx.strokeStyle = "hsl(30, 90%, 55%)";
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(x - w / 2, rowY - h / 2, w, h);
+    ctx.strokeRect(x - w / 2, rowY - h / 2, w, h);
+    ctx.fillStyle = "#e6edf3";
+    ctx.font = "11px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(truncate(item.qualname, 18), x, rowY);
+    ctx.restore();
+
+    ctx.save();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    var ty = rowY - h / 2 - 4;
+    ctx.font = "bold 11px monospace";
+    ctx.fillStyle = "hsl(" + item.hue + ", 60%, 72%)";
+    var idText = "#" + item.shortId;
+    ctx.fillText(idText, x - w / 2, ty);
+    ctx.font = "10px monospace";
+    ctx.fillStyle = "#f0883e";
+    var elapsed =
+      virtualT !== null ? Math.max(0, Math.round((virtualT - item.startT) * 1000)) : 0;
+    ctx.fillText(
+      "⇢ on worker " + elapsed + "ms",
+      x - w / 2 + ctx.measureText(idText).width + 10,
+      ty
+    );
+    ctx.restore();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+
+    hoverRects.push({
+      x: x - w / 2,
+      y: rowY - h / 2,
+      w: w,
+      h: h,
+      qualname: item.qualname,
+      awaiting: "running on a worker thread for #" + item.shortId,
+      awaitDone: false,
+    });
+  }
+
   function drawTooltip() {
     if (mouseX < 0) return;
     for (var i = hoverRects.length - 1; i >= 0; i--) {
@@ -1496,18 +1663,38 @@
   // Draw one zone: its header, spine, and row stack (clipped to the zone's
   // band, scrolled by its own offset). Returns the laid-out rows (for the
   // shared click/hover hit-test) and the clamped scroll offset.
-  function drawZone(zone, band, list, scrollVal) {
+  function drawZone(zone, band, list, scrollVal, work) {
     var spineTop = band.top + ZONE_HEADER_H;
     var spineBottom = Math.max(spineTop + 20, band.bottom);
     var bandRowsH = spineBottom - spineTop;
 
     var layout = layoutRowList(list);
+    // Live worker entries stack below the request rows in the same content
+    // space, so they scroll together and count toward the scrollable height.
+    var workRows = [];
+    if (work && work.length) {
+      var wy = layout.contentHeight;
+      for (var w = 0; w < work.length; w++) {
+        workRows.push({
+          item: work[w],
+          contentTop: wy,
+          height: WORK_ROW_H,
+          contentCenter: wy + WORK_ROW_H / 2,
+        });
+        wy += WORK_ROW_H + ROW_GAP;
+      }
+      layout.contentHeight = wy;
+    }
     var maxScroll = Math.max(0, layout.contentHeight - bandRowsH);
     var s = Math.max(0, Math.min(scrollVal, maxScroll));
 
     for (var i = 0; i < layout.rows.length; i++) {
       layout.rows[i].screenTop = spineTop + layout.rows[i].contentTop - s;
       layout.rows[i].screenCenter = spineTop + layout.rows[i].contentCenter - s;
+    }
+    for (var k = 0; k < workRows.length; k++) {
+      workRows[k].screenTop = spineTop + workRows[k].contentTop - s;
+      workRows[k].screenCenter = spineTop + workRows[k].contentCenter - s;
     }
 
     drawZoneHeader(zone, band, list);
@@ -1558,11 +1745,19 @@
       }
       drawRowHeader(b, state, row.screenCenter);
     }
+    for (var m = 0; m < workRows.length; m++) {
+      var wr = workRows[m];
+      if (wr.screenCenter < spineTop - wr.height || wr.screenCenter > spineBottom + wr.height) {
+        continue;
+      }
+      drawWorkRow(wr.item, spine, wr.screenCenter);
+    }
+
     poolZoneDraw = false;
     ctx.restore();
 
     drawScrollbar(spine, maxScroll, layout.contentHeight, s);
-    return { rows: layout.rows, scroll: s };
+    return { rows: layout.rows, work: workRows, scroll: s };
   }
 
   function render() {
@@ -1589,12 +1784,25 @@
       (b.zone === "pool" ? poolList : loopList).push(b);
     });
 
+    // Offloaded calls running RIGHT NOW belong in the threadpool zone as their
+    // own entries — the worker is busy with them, while the request that asked
+    // for them stays parked in the loop zone. Honour the row filter through
+    // the owning request.
+    var poolWork = [];
+    activeOffloads.forEach(function (item) {
+      var owner = branches.get(item.traceId);
+      if (owner && matchesFilter(owner)) poolWork.push(item);
+    });
+    poolWork.sort(function (a, b) {
+      return a.startT - b.startT;
+    });
+
     // Divider sits proportionally to each zone's row count, clamped so both
     // headers always show.
     var top = ZONE_TOP;
     var bottom = canvas.height - ZONE_BOTTOM_MARGIN;
     var avail = Math.max(40, bottom - top);
-    var n = loopList.length + poolList.length;
+    var n = loopList.length + poolList.length + poolWork.length;
     var frac = n === 0 ? 0.5 : loopList.length / n;
     frac = Math.max(ZONE_MIN_FRAC, Math.min(ZONE_MAX_FRAC, frac));
     dividerY = top + frac * avail;
@@ -1605,7 +1813,7 @@
     var lr = drawZone("loop", loopBand, loopList, scrollLoop);
     scrollLoop = lr.scroll;
     drawDivider(dividerY);
-    var pr = drawZone("pool", poolBand, poolList, scrollPool);
+    var pr = drawZone("pool", poolBand, poolList, scrollPool, poolWork);
     scrollPool = pr.scroll;
 
     currentRows = lr.rows.concat(pr.rows); // shared click/scroll hit-test
@@ -1616,7 +1824,7 @@
       renderInspector();
     }
 
-    if (loopList.length === 0 && poolList.length === 0) {
+    if (loopList.length === 0 && poolList.length === 0 && poolWork.length === 0) {
       drawIdleHint(branches.size > 0);
     }
 

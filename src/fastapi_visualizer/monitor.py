@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import sys
+import sysconfig
 import threading
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import identity
@@ -61,6 +64,55 @@ CO_ASYNC_GENERATOR = 0x200
 CO_ASYNC = CO_COROUTINE | CO_ASYNC_GENERATOR
 
 _PKG_DIR = str(Path(__file__).resolve().parent)
+
+
+def _library_prefixes() -> tuple[str, ...]:
+    """Directories that are never application code, even if inside a root.
+
+    `roots` is normally the project root — and a virtualenv usually lives
+    *inside* the project root (./venv, ./.venv). A plain
+    `filename.startswith(root)` therefore sweeps in the whole of
+    site-packages: Django, DRF, celery and everything else. That produced
+    ~1200 call nodes for a single request in a real project.
+
+    Excluding these unconditionally is safe: they are by definition not the
+    app's own source, which is the only thing this tool claims to trace.
+    """
+    paths = set()
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        try:
+            value = sysconfig.get_paths().get(key)
+            if value:
+                paths.add(str(Path(value).resolve()))
+        except Exception:
+            pass
+    # A venv's own prefix (and the base interpreter's) covers anything the
+    # sysconfig keys miss.
+    for prefix in (getattr(sys, "prefix", None), getattr(sys, "base_prefix", None)):
+        if prefix:
+            try:
+                paths.add(str(Path(prefix).resolve()))
+            except Exception:
+                pass
+    return tuple(sorted(paths))
+
+
+_LIB_PREFIXES = _library_prefixes()
+# Catches a virtualenv nested anywhere under a root, including layouts the
+# prefix list above cannot see (e.g. a venv for a *different* interpreter that
+# happens to sit inside the project).
+_LIB_MARKERS = (
+    f"{os.sep}site-packages{os.sep}",
+    f"{os.sep}dist-packages{os.sep}",
+)
+
+# The node id of the innermost frame currently executing, stored in a
+# contextvar so it survives an OFFLOAD. Both anyio and asgiref copy the calling
+# context into the worker thread, so a frame that runs there can still name the
+# frame that offloaded it. Without this the worker thread's stack starts empty,
+# the first frame on it reports parent_id None, and it masquerades as a request
+# root — which broke both call-tree nesting and zone classification.
+_current_node: ContextVar[int | None] = ContextVar("_viz_current_node", default=None)
 
 _node_counter = itertools.count(1)
 _thread_local = threading.local()
@@ -92,6 +144,14 @@ class Monitor:
     def _in_root(self, filename: str) -> bool:
         if filename.startswith(_PKG_DIR):
             return False
+        # Library code is excluded even when it sits under a configured root —
+        # see _library_prefixes(). Checked BEFORE the root test, because a
+        # virtualenv inside the project root would otherwise match it.
+        if filename.startswith(_LIB_PREFIXES):
+            return False
+        for marker in _LIB_MARKERS:
+            if marker in filename:
+                return False
         return filename.startswith(self.roots)
 
     def install(self) -> None:
@@ -264,7 +324,18 @@ class Monitor:
             # Stack entries are (node_id, qualname) so a frame re-opened after a
             # child returns (see _on_exit) can name itself in a loop_blocked
             # event instead of emitting a blank qualname.
-            parent_id = stack[-1][0] if stack else None
+            is_worker = task is None
+            # First frame on THIS worker thread: the offloaded chain's root.
+            # Kept separate from parent_id, which is now a real logical parent.
+            is_thread_root = is_worker and not stack
+            if stack:
+                parent_id = stack[-1][0]
+            elif is_worker:
+                # Offloaded: inherit the frame that offloaded us, via the
+                # context copied into this thread.
+                parent_id = _current_node.get()
+            else:
+                parent_id = None
             node_id = next(_node_counter)
             now = time.monotonic()
             # On the loop thread, calling this child is a boundary for the
@@ -272,7 +343,11 @@ class Monitor:
             # until now), then open one for the child we're entering.
             if task is not None:
                 self._loop_close(now)
-            stack.append((node_id, code.co_qualname))
+            try:
+                token = _current_node.set(node_id)
+            except Exception:
+                token = None
+            stack.append((node_id, code.co_qualname, token))
             is_async = bool(code.co_flags & CO_ASYNC)
             # True threadpool signal: code running with NO current asyncio task
             # is on an anyio worker thread (that's exactly where _stack() falls
@@ -280,7 +355,6 @@ class Monitor:
             # `parent_id is None and not is_async` guess, which misfired on
             # loop-run async generators. Async work always has a current task,
             # so it can never be mislabeled as offloaded now.
-            is_worker = task is None
             execution = "threadpool" if is_worker else "event_loop"
             self._push(
                 CALL_ENTER,
@@ -299,7 +373,7 @@ class Monitor:
             # Mark the ROOT frame of a worker-thread call chain as offloaded
             # (parent_id None = top of this thread's stack), wrapping the whole
             # offloaded subtree in one offload_start/offload_end pair.
-            if is_worker and parent_id is None:
+            if is_thread_root:
                 self._offloaded.add(node_id)
                 self._push(OFFLOAD_START, task, code.co_qualname, {"node_id": node_id})
             if task is not None:
@@ -314,7 +388,12 @@ class Monitor:
             task, stack = self._stack()
             if not stack:
                 return
-            node_id, _qual = stack.pop()
+            node_id, _qual, token = stack.pop()
+            if token is not None:
+                try:
+                    _current_node.reset(token)
+                except Exception:
+                    pass  # token from another context; fail soft
             now = time.monotonic()
             # Returning is a boundary for THIS frame: close its interval, then
             # re-open one for the parent that now regains control, naming it
@@ -327,7 +406,7 @@ class Monitor:
                 self._offloaded.discard(node_id)
                 self._push(OFFLOAD_END, task, code.co_qualname, {"node_id": node_id})
             if task is not None and stack:
-                parent_id, parent_qual = stack[-1]
+                parent_id, parent_qual = stack[-1][0], stack[-1][1]
                 self._loop_open(parent_id, now, task, parent_qual)
         except Exception:
             pass
