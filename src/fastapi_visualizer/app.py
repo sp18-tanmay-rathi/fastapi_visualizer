@@ -95,7 +95,13 @@ def _is_multi_worker() -> bool:
     return False
 
 
-def _mount_dashboard(app, path: str) -> None:
+def build_viz_app():
+    """The dashboard sub-app: page, script, WebSocket.
+
+    Split out from _mount_dashboard so the framework-agnostic ASGI
+    wrapper (asgi.py) can serve the same routes without a Starlette
+    host app to .mount() onto.
+    """
     async def index(request):
         return FileResponse(STATIC_DIR / "index.html")
 
@@ -161,17 +167,20 @@ def _mount_dashboard(app, path: str) -> None:
             reader.cancel()
             collector.unsubscribe(queue)
 
-    viz_app = Starlette(
+    return Starlette(
         routes=[
             Route("/", index),
             Route("/dashboard.js", dashboard_js),
             WebSocketRoute("/ws", ws_endpoint),
         ]
     )
+
+
+def _mount_dashboard(app, path: str) -> None:
     # The dashboard page and its WebSocket are siblings under this mount, and
     # dashboard.js derives the socket URL from its own location.pathname — so
     # nothing downstream needs to know the path we picked here.
-    app.mount(path, viz_app)
+    app.mount(path, build_viz_app())
 
 
 def visualize(
