@@ -6,11 +6,11 @@ gap.
 
 ## Short answer
 
-Yes, with a new entry point. **No instrumentation changes were needed at all** —
-the tracing core was already framework-agnostic. Only the *attachment* was
-FastAPI-shaped.
+Yes, through the same `visualize()` call. **No instrumentation changes were
+needed at all** — the tracing core was already framework-agnostic. Only the
+*attachment* was FastAPI-shaped.
 
-## Why `visualize()` could not work
+## Why `visualize()` could not work as it was written
 
 Everything Django-incompatible was four Starlette-specific calls in
 `app.py::visualize()`:
@@ -29,20 +29,41 @@ written that way to avoid `BaseHTTPMiddleware`'s contextvar bug), and
 
 ## What was added
 
-`src/fastapi_visualizer/asgi.py` — `visualize_asgi(app, ...)`, which returns a
-wrapper ASGI app instead of mutating one:
+**One entry point, two attach strategies.** `visualize()` detects what the app
+can do and picks:
+
+| App | Strategy | Returns |
+|---|---|---|
+| Starlette / FastAPI | mutate in place (middleware, mount, lifespan wrap) | the same object |
+| Django / any other ASGI | wrap in a new ASGI app | a **new** object — must be bound |
 
 ```python
-application = visualize_asgi(get_asgi_application(), enabled=True)
+# FastAPI — unchanged, return value optional
+visualize(app, enabled=True)
+
+# Django — must assign
+application = visualize(get_asgi_application(), enabled=True)
 ```
 
-It composes in plain ASGI: owns the `lifespan` scope (install/uninstall the
-monitor), serves the dashboard for any path under `path`, and passes everything
-else to the wrapped app through `TraceMiddleware`.
+Mutating is kept for Starlette because wrapping its `lifespan_context` still
+runs the app's **own** startup handlers; the wrap strategy owns lifespan and
+cannot forward it, so using it on a FastAPI app would silently skip that app's
+startup. Detection is `isinstance(app, Starlette)` — FastAPI subclasses it,
+Django's `ASGIHandler` and bare callables do not.
 
-`app.py` needed one small refactor: `_mount_dashboard()` was split so the
-dashboard sub-app is built by a reusable `build_viz_app()`, which the wrapper
-serves directly rather than mounting.
+`src/fastapi_visualizer/asgi.py` holds `VisualizedASGIApp`, the wrap-strategy
+app: it owns the `lifespan` scope, serves the dashboard for any path under
+`path`, and passes everything else through `TraceMiddleware`. Both strategies
+share `install_runtime()` / `uninstall_runtime()` so they cannot drift.
+
+**The one risk of merging:** a Django user who writes `visualize(application)`
+without assigning gets silence — no dashboard, no error. Mitigated by printing
+`wrapped ASGIHandler — assign the result ...` on the wrap path.
+
+`app.py` needed two small refactors: `_mount_dashboard()` was split so the
+dashboard sub-app comes from a reusable `build_viz_app()`, and the startup /
+shutdown closures became module-level `install_runtime()` / `uninstall_runtime()`
+shared by both strategies.
 
 `examples/django_demo.py` — a single-file Django ASGI app (`settings.configure()`,
 no generated project) with an async view, a sync view, and a blocking view.
@@ -98,11 +119,10 @@ than the instrumentation is" principle as the UNTRACED state.
   Django's own `DEBUG=True`. You must pass `enabled=True` or export
   `FASTAPI_VIZ=1`. Could be improved by also checking
   `django.conf.settings.DEBUG` when Django is importable.
-- **Lifespan is not forwarded** to the wrapped app. Django does not implement it,
-  so this is correct there — but it means `visualize_asgi()` is *not* a drop-in
-  for a Starlette/FastAPI app, whose own startup handlers would be skipped.
-  FastAPI users should keep using `visualize()`. If the wrapper ever becomes the
-  single entry point, it needs proper lifespan proxying.
+- **Lifespan is not forwarded** on the wrap strategy. Django does not implement
+  it, so this is correct there — and it is exactly why Starlette apps keep the
+  mutate strategy rather than being wrapped. If the wrapper ever has to serve
+  Starlette too, it needs proper lifespan proxying first.
 - **ASGI only.** Under WSGI there is no event loop, so there is nothing to
   visualize. `get_asgi_application()` and an ASGI server are required.
 - **Starlette is still imported** for the dashboard routes, so a Django user
@@ -111,22 +131,26 @@ than the instrumentation is" principle as the UNTRACED state.
 
 ## Tests
 
-`tests/test_asgi_wrapper.py` — 7 cases: disabled returns the original app
+`tests/test_asgi_wrapper.py` — 10 cases: disabled returns the original app
 untouched, a hand-written ASGI app is traced, the dashboard is served under the
-mount (default and custom path), and three Django cases (async view on the loop,
-sync view offloaded, outcome recorded). Django is an optional dev dependency and
-those cases `importorskip`.
+mount (default and custom path), three Django cases (async view on the loop,
+sync view offloaded, outcome recorded), and three that pin **strategy
+selection** — a Starlette app comes back as the same object, a non-Starlette one
+comes back wrapped with the original untouched, and both reach the dashboard.
+Django is an optional dev dependency and those cases `importorskip`.
 
 `pyproject.toml` gained `pythonpath = ["."]` so tests can import
 `examples.django_demo`.
 
-Full suite: 60 passing.
+Full suite: 63 passing.
 
 ## If we want to keep it
 
 1. Fix the pool grid to show "not available" rather than `0/40`.
 2. Teach `_resolve_enabled` about `django.conf.settings.DEBUG`.
-3. Decide whether `visualize_asgi()` is the public entry point for everything
-   non-FastAPI, or whether `visualize()` should detect and delegate.
-4. README section + rename honesty: the package is called
+3. ~~Decide whether there should be one entry point~~ — done: `visualize()`
+   detects and delegates, `visualize_asgi()` is gone.
+4. Drop the unused `fastapi` runtime dependency (only `starlette` is imported),
+   so a Django project does not pull FastAPI in for nothing.
+5. README section + rename honesty: the package is called
    `fastapi-visualizer` but the core is really an *ASGI* visualizer.

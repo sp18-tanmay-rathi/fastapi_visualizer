@@ -11,9 +11,9 @@ Then open http://127.0.0.1:8200/_viz and drive traffic:
 
     uv run python examples/drive.py --base http://127.0.0.1:8200
 
-Django needs `visualize_asgi()`, not `visualize()`: a Django ASGIHandler is a
-plain callable with no .add_middleware/.mount/.state/.router, so there is
-nothing to attach to. The wrapper composes in plain ASGI instead.
+Note the assignment: `visualize()` cannot mutate a Django ASGIHandler (no
+.add_middleware/.mount/.state/.router to attach to), so it returns a wrapped
+ASGI app and you must bind the result.
 """
 
 import asyncio
@@ -99,12 +99,12 @@ urlpatterns = [
 
 from django.core.asgi import get_asgi_application  # noqa: E402
 
-from fastapi_visualizer import visualize_asgi  # noqa: E402
+from fastapi_visualizer import visualize  # noqa: E402
 
 # enabled=True is required here: auto-detection reads `app.debug`, which a
 # Django ASGIHandler does not have, so it would otherwise resolve to OFF even
 # with Django's own DEBUG=True.
-application = visualize_asgi(
+application = visualize(
     get_asgi_application(),
     enabled=True,
     roots=[BASE_DIR],

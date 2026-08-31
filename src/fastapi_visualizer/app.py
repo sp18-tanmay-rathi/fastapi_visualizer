@@ -183,6 +183,69 @@ def _mount_dashboard(app, path: str) -> None:
     app.mount(path, build_viz_app())
 
 
+async def install_runtime(monitor, state: dict) -> None:
+    """Start tracing on the running loop. Shared by both attach strategies.
+
+    NOTE: deliberately NO loop.set_debug(True). It changes the host app's
+    behavior (slow-callback logging, coroutine origin tracking) and costs
+    overhead, and blocking detection does not need it — monitor.py times wall
+    clock between sys.monitoring boundaries instead of reading asyncio's
+    slow-callback machinery.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except Exception:
+        return
+    try:
+        identity.install_task_factory(loop)
+    except Exception:
+        pass
+    try:
+        monitor.install()
+    except Exception:
+        pass
+    try:
+        task, stop_event = threadpool.start(loop)
+        state["poll_task"] = task
+        state["stop_event"] = stop_event
+    except Exception:
+        pass
+    try:
+        if _is_multi_worker():
+            _log.warning(
+                "fastapi-visualizer: running under multiple workers "
+                "(PID %d) — dashboard shows only THIS worker's traffic. "
+                "Run a single worker to see all requests.",
+                os.getpid(),
+            )
+    except Exception:
+        pass
+
+
+async def uninstall_runtime(monitor, state: dict) -> None:
+    """Stop tracing and free the sys.monitoring tool id."""
+    stop_event = state.get("stop_event")
+    poll_task = state.get("poll_task")
+    if stop_event is not None:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+    if poll_task is not None:
+        try:
+            await asyncio.wait_for(poll_task, timeout=1)
+        except Exception:
+            poll_task.cancel()
+    try:
+        monitor.uninstall()
+    except Exception:
+        pass
+    try:
+        identity.uninstall_task_factory(asyncio.get_running_loop())
+    except Exception:
+        pass
+
+
 def visualize(
     app,
     roots: list[str] | None = None,
@@ -215,12 +278,12 @@ def visualize(
         try:
             app.state._viz = {"enabled": False}
         except Exception:
-            pass
+            pass  # not a Starlette app — nothing to stash the flag on
         print(
             f"[fastapi_visualizer] disabled — set {ENV_FLAG}=1 or "
             "visualize(app, enabled=True) to enable"
         )
-        return
+        return app
 
     # Validate the mount path AFTER the enable gate: a disabled visualizer
     # touches nothing, so a bad path surfaces the moment you turn it on rather
@@ -234,6 +297,44 @@ def visualize(
     except Exception:
         roots = []
 
+    monitor = Monitor(roots, slow_ms=slow_ms)
+    state = {
+        "enabled": True,
+        "monitor": monitor,
+        "poll_task": None,
+        "stop_event": None,
+    }
+
+    # Two attach strategies, chosen by what the app can actually do.
+    #
+    # A Starlette/FastAPI app is MUTATED in place: we register middleware,
+    # mount the dashboard on its router, and wrap its lifespan_context — which
+    # matters because that wrap still runs the app's OWN startup handlers.
+    #
+    # Anything else (Django's ASGIHandler, a bare ASGI callable) has none of
+    # those hooks, so it is WRAPPED in a new ASGI app instead. That is why the
+    # return value matters: for the wrap strategy the caller must bind it.
+    if not isinstance(app, Starlette):
+        from .asgi import VisualizedASGIApp  # local import: asgi imports us
+
+        wrapped = VisualizedASGIApp(
+            TraceMiddleware(
+                app,
+                correlate_request_id=correlate_request_id,
+                expose_request_id=expose_request_id,
+            ),
+            build_viz_app(),
+            monitor,
+            path,
+            state,
+        )
+        print(
+            f"[fastapi_visualizer] wrapped {type(app).__name__} — assign the "
+            "result, e.g. `application = visualize(application)`, or nothing "
+            "is attached"
+        )
+        return wrapped
+
     try:
         app.add_middleware(
             TraceMiddleware,
@@ -243,71 +344,13 @@ def visualize(
     except Exception:
         pass
 
-    monitor = Monitor(roots, slow_ms=slow_ms)
-    state = {
-        "enabled": True,
-        "monitor": monitor,
-        "poll_task": None,
-        "stop_event": None,
-    }
     app.state._viz = state
 
     async def on_startup() -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except Exception:
-            return
-        # NOTE: deliberately NO loop.set_debug(True) here. It changes the host
-        # app's behavior (slow-callback logging, coroutine origin tracking) and
-        # costs overhead, and blocking detection does not need it — monitor.py
-        # times wall clock between sys.monitoring boundaries instead of reading
-        # asyncio's slow-callback machinery.
-        try:
-            identity.install_task_factory(loop)
-        except Exception:
-            pass
-        try:
-            monitor.install()
-        except Exception:
-            pass
-        try:
-            task, stop_event = threadpool.start(loop)
-            state["poll_task"] = task
-            state["stop_event"] = stop_event
-        except Exception:
-            pass
-        try:
-            if _is_multi_worker():
-                _log.warning(
-                    "fastapi-visualizer: running under multiple workers "
-                    "(PID %d) — dashboard shows only THIS worker's traffic. "
-                    "Run a single worker to see all requests.",
-                    os.getpid(),
-                )
-        except Exception:
-            pass
+        await install_runtime(monitor, state)
 
     async def on_shutdown() -> None:
-        stop_event = state.get("stop_event")
-        poll_task = state.get("poll_task")
-        if stop_event is not None:
-            try:
-                stop_event.set()
-            except Exception:
-                pass
-        if poll_task is not None:
-            try:
-                await asyncio.wait_for(poll_task, timeout=1)
-            except Exception:
-                poll_task.cancel()
-        try:
-            monitor.uninstall()
-        except Exception:
-            pass
-        try:
-            identity.uninstall_task_factory(asyncio.get_running_loop())
-        except Exception:
-            pass
+        await uninstall_runtime(monitor, state)
 
     # Install by WRAPPING the router's lifespan_context, not via
     # add_event_handler("startup"/"shutdown"). When the app is created with a
@@ -341,3 +384,8 @@ def visualize(
         _mount_dashboard(app, path)
     except Exception:
         pass
+
+    # Returned for symmetry with the wrap strategy, so `app = visualize(app)`
+    # is correct in both cases. Existing callers that ignore it still work,
+    # because this path already mutated `app` in place.
+    return app

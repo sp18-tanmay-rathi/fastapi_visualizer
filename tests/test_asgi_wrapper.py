@@ -1,7 +1,8 @@
-"""visualize_asgi(): attaching to a non-Starlette ASGI app (experimental).
+"""visualize() against a non-Starlette ASGI app (the wrap strategy).
 
-Covers the wrapper against a hand-written ASGI app (fast, no framework) and
-against a real Django ASGIHandler, which is the case it exists for.
+One entry point serves both: visualize() mutates a Starlette app in place and
+wraps anything else. These cover the wrap half — a hand-written ASGI app and a
+real Django ASGIHandler.
 """
 
 import asyncio
@@ -11,7 +12,7 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 
-from fastapi_visualizer import collector, visualize_asgi
+from fastapi_visualizer import collector, visualize
 from fastapi_visualizer.asgi import VisualizedASGIApp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -84,12 +85,12 @@ async def plain_app(scope, receive, send):
 async def test_disabled_returns_the_original_app(monkeypatch):
     monkeypatch.delenv("FASTAPI_VIZ", raising=False)
     # A bare ASGI callable has no .debug, so auto-detect resolves to off.
-    wrapped = visualize_asgi(plain_app, roots=[HERE])
+    wrapped = visualize(plain_app, roots=[HERE])
     assert wrapped is plain_app
 
 
 async def test_wraps_a_plain_asgi_app_and_traces_it():
-    app = visualize_asgi(plain_app, roots=[HERE], enabled=True)
+    app = visualize(plain_app, roots=[HERE], enabled=True)
     assert isinstance(app, VisualizedASGIApp)
     assert app.state["enabled"] is True
 
@@ -104,7 +105,7 @@ async def test_wraps_a_plain_asgi_app_and_traces_it():
 
 
 async def test_serves_the_dashboard_under_the_mount_path():
-    app = visualize_asgi(plain_app, roots=[HERE], enabled=True)
+    app = visualize(plain_app, roots=[HERE], enabled=True)
     async with client_for_asgi(app) as client:
         assert (await client.get("/_viz/")).status_code == 200
         assert (await client.get("/_viz/dashboard.js")).status_code == 200
@@ -113,7 +114,7 @@ async def test_serves_the_dashboard_under_the_mount_path():
 
 
 async def test_custom_path_moves_the_dashboard():
-    app = visualize_asgi(plain_app, roots=[HERE], enabled=True, path="/debug/viz")
+    app = visualize(plain_app, roots=[HERE], enabled=True, path="/debug/viz")
     async with client_for_asgi(app) as client:
         assert (await client.get("/debug/viz/")).status_code == 200
         # /_viz is no longer the dashboard, so it falls through to the app.
@@ -172,3 +173,50 @@ async def test_django_request_outcome_recorded(django_app):
     assert ends
     assert ends[-1].extra.get("status") == 200
     assert ends[-1].extra.get("duration_ms") >= 200
+
+
+# --- strategy selection ----------------------------------------------------
+# One entry point, two attach strategies. These pin which one is chosen, since
+# the difference is observable: mutate returns the SAME object, wrap returns a
+# new one that the caller must bind.
+
+
+async def test_starlette_app_is_mutated_in_place_and_returned():
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    @app.get("/w")
+    async def w():
+        return {"ok": True}
+
+    returned = visualize(app, roots=[HERE], enabled=True)
+
+    # Same object: existing callers that ignore the return value still work.
+    assert returned is app
+    assert not isinstance(returned, VisualizedASGIApp)
+    assert app.state._viz["enabled"] is True
+
+
+async def test_non_starlette_app_is_wrapped_not_mutated():
+    returned = visualize(plain_app, roots=[HERE], enabled=True)
+
+    assert returned is not plain_app
+    assert isinstance(returned, VisualizedASGIApp)
+    # The original is untouched — nothing was bolted onto it.
+    assert not hasattr(plain_app, "state")
+
+
+async def test_both_strategies_reach_the_same_dashboard():
+    from fastapi import FastAPI
+
+    fast = visualize(FastAPI(), roots=[HERE], enabled=True)
+    plain = visualize(plain_app, roots=[HERE], enabled=True)
+
+    async with fast.router.lifespan_context(fast):
+        transport = httpx.ASGITransport(app=fast)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            assert (await c.get("/_viz/")).status_code == 200
+
+    async with client_for_asgi(plain) as c:
+        assert (await c.get("/_viz/")).status_code == 200
