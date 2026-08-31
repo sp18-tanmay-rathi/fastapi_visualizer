@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import sys
+import sysconfig
 import threading
 import time
 from pathlib import Path
@@ -62,6 +64,47 @@ CO_ASYNC = CO_COROUTINE | CO_ASYNC_GENERATOR
 
 _PKG_DIR = str(Path(__file__).resolve().parent)
 
+
+def _library_prefixes() -> tuple[str, ...]:
+    """Directories that are never application code, even if inside a root.
+
+    `roots` is normally the project root — and a virtualenv usually lives
+    *inside* the project root (./venv, ./.venv). A plain
+    `filename.startswith(root)` therefore sweeps in the whole of
+    site-packages: Django, DRF, celery and everything else. That produced
+    ~1200 call nodes for a single request in a real project.
+
+    Excluding these unconditionally is safe: they are by definition not the
+    app's own source, which is the only thing this tool claims to trace.
+    """
+    paths = set()
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        try:
+            value = sysconfig.get_paths().get(key)
+            if value:
+                paths.add(str(Path(value).resolve()))
+        except Exception:
+            pass
+    # A venv's own prefix (and the base interpreter's) covers anything the
+    # sysconfig keys miss.
+    for prefix in (getattr(sys, "prefix", None), getattr(sys, "base_prefix", None)):
+        if prefix:
+            try:
+                paths.add(str(Path(prefix).resolve()))
+            except Exception:
+                pass
+    return tuple(sorted(paths))
+
+
+_LIB_PREFIXES = _library_prefixes()
+# Catches a virtualenv nested anywhere under a root, including layouts the
+# prefix list above cannot see (e.g. a venv for a *different* interpreter that
+# happens to sit inside the project).
+_LIB_MARKERS = (
+    f"{os.sep}site-packages{os.sep}",
+    f"{os.sep}dist-packages{os.sep}",
+)
+
 _node_counter = itertools.count(1)
 _thread_local = threading.local()
 
@@ -92,6 +135,14 @@ class Monitor:
     def _in_root(self, filename: str) -> bool:
         if filename.startswith(_PKG_DIR):
             return False
+        # Library code is excluded even when it sits under a configured root —
+        # see _library_prefixes(). Checked BEFORE the root test, because a
+        # virtualenv inside the project root would otherwise match it.
+        if filename.startswith(_LIB_PREFIXES):
+            return False
+        for marker in _LIB_MARKERS:
+            if marker in filename:
+                return False
         return filename.startswith(self.roots)
 
     def install(self) -> None:
