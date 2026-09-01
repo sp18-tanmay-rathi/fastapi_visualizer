@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from starlette.responses import FileResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocketDisconnect
 
-from . import identity, threadpool
+from . import blockingcalls, identity, threadpool, watchdog
 from .collector import collector
 from .identity import TraceMiddleware
 from .monitor import Monitor
@@ -178,6 +179,8 @@ def visualize(
     app,
     roots: list[str] | None = None,
     slow_ms: int = 100,
+    stall_ms: int = 250,
+    detect_blocking_calls: bool = True,
     enabled: bool | None = None,
     path: str = "/_viz",
     correlate_request_id: bool = False,
@@ -191,7 +194,20 @@ def visualize(
         leaving the call in place is safe in production.
     slow_ms:
         blocking-detection threshold — an in-root loop frame running longer
-        than this without yielding is reported as a blocking span.
+        than this without yielding is reported as a blocking span, once it
+        ends.
+    detect_blocking_calls:
+        report calls that block the loop by WHAT THEY ARE (opening a file,
+        connecting a socket, spawning a process) regardless of how fast they
+        are -- the only way to catch a 3ms database call that no threshold
+        would flag. Uses sys.addaudithook, which observes without altering
+        behavior; note an audit hook cannot be removed once added, so turning
+        this off later makes it inert rather than absent.
+    stall_ms:
+        live stall threshold — if the event loop stops responding for longer
+        than this, a watchdog thread reports it WHILE it is happening, with
+        the loop's stack. 0 disables it. Keep it well above the watchdog's
+        50ms heartbeat, or a healthy loop will trip it.
     path:
         where to mount the dashboard (default "/_viz"). Useful to avoid a
         collision with an existing route, or to hide it behind a less
@@ -240,6 +256,10 @@ def visualize(
         "monitor": monitor,
         "poll_task": None,
         "stop_event": None,
+        "watchdog": None,
+        "stall_ms": stall_ms,
+        "blocking_calls": None,
+        "detect_blocking_calls": detect_blocking_calls,
     }
     app.state._viz = state
 
@@ -268,6 +288,19 @@ def visualize(
         except Exception:
             pass
         try:
+            if state.get("detect_blocking_calls"):
+                state["blocking_calls"] = blockingcalls.start(
+                    threading.get_ident(), monitor=monitor
+                )
+        except Exception:
+            pass
+        try:
+            state["watchdog"] = watchdog.start(
+                loop, stall_ms=state.get("stall_ms", 250), monitor=monitor
+            )
+        except Exception:
+            pass
+        try:
             if _is_multi_worker():
                 _log.warning(
                     "fastapi-visualizer: running under multiple workers "
@@ -279,6 +312,18 @@ def visualize(
             pass
 
     async def on_shutdown() -> None:
+        bc = state.get("blocking_calls")
+        if bc is not None:
+            try:
+                bc.uninstall()
+            except Exception:
+                pass
+        wd = state.get("watchdog")
+        if wd is not None:
+            try:
+                wd.stop()
+            except Exception:
+                pass
         stop_event = state.get("stop_event")
         poll_task = state.get("poll_task")
         if stop_event is not None:

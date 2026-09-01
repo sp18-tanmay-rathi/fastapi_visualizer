@@ -71,6 +71,9 @@ fields the frontend keys its two zones off of:
 | `pool_sample` | `{borrowed, total, queued}` | threadpool occupancy (emitted only on change) |
 | `loop_blocked` | `{node_id, qualname, duration_ms}` | an in-root loop frame ran > `slow_ms` without yielding (stamped at the span START) |
 | `loop_unblocked` | `{node_id, qualname, duration_ms}` | the blocking span ended (stamped at the span END) |
+| `loop_stalled` | `{qualname, file, line, stack, elapsed_ms}` | the watchdog missed its heartbeat: the loop is unresponsive **right now**. `stack` is the captured loop-thread traceback |
+| `loop_unstalled` | `{qualname, duration_ms}` | the loop started responding again |
+| `blocking_call` | `{category, detail, node_id, qualname}` | the loop thread performed a forbidden wait (file / socket / DNS / database / subprocess), regardless of how long it took |
 
 `Event` is `{seq, t, kind, trace_id, task_id, name, extra}` (`events.py`), with
 `to_dict()` for JSON. `node_id` is a global monotonically increasing int
@@ -103,6 +106,77 @@ expected — that's the point of the threadpool. Because it's a single thread,
 the interval fields need no lock. Yielding (`PY_YIELD`) closes the interval and
 leaves nothing attributed, so the await/scheduling wait is never counted as
 blocking; a long run *before* an await still is.
+
+The timer alone is not enough, for two reasons. It is **retrospective** — the
+span is reported once the frame ends, so a server that is hung right now shows
+nothing. And it is **duration-based** — a 5ms `open()` on the loop thread is a
+real bug that no threshold will ever catch, while a legitimate 200ms
+computation trips it. Two more detectors close those gaps.
+
+#### Watchdog (`watchdog.py`) — "is the loop stuck *right now*?"
+
+A coroutine on the loop bumps a timestamp every 50ms. A **daemon thread**
+(deliberately not on the loop — a stuck loop cannot report on itself) checks
+that timestamp; when it has not moved for `stall_ms` (default 250, `stall_ms=0`
+disables), the loop is not running callbacks, so it captures the loop thread's
+frames with `sys._current_frames()` and emits `loop_stalled`. `_culprit()`
+blames the **deepest in-root frame** in that stack, so a stall inside a library
+is still attributed to the application function that called it. `loop_unstalled`
+closes the span when the heartbeat resumes; `stop()` closes any span still open
+at shutdown.
+
+The watchdog is the only detector that sees a request which **never returns** —
+the timer needs a `PY_RETURN` that will never arrive.
+
+Its one structural limit: **it cannot reach the browser during the freeze.** The
+WebSocket send runs on the loop that is stuck, so the event queues behind the
+stall and arrives only once the loop recovers. It therefore also writes the
+stall and its stack to the **log** from its own thread, immediately — which is
+where you look when a server hangs.
+
+#### Listener (`blockingcalls.py`) — "did the loop touch the outside world?"
+
+`sys.addaudithook` receives an audit event for every file open, socket connect,
+DNS lookup, DB connect and subprocess spawn in the process. If one fires while
+the loop thread is inside a traced request, that is a blocking wait by
+definition — **no threshold involved** — and a `blocking_call` is emitted with a
+category (`file`, `network`, `dns`, `database`, `process`) and a short detail.
+
+Four filters keep it quiet: its own package is skipped, worker threads are
+skipped (blocking there is correct), calls outside an active trace are skipped,
+and **imports** are skipped — `_is_import()` inspects the **full** path before
+truncation, since a module load legitimately reads files. A bounded `_seen` set
+(`_MAX_SEEN = 4096`) dedups repeats without growing without limit.
+
+Its limit is **pooled connections**: Python announces that a connection was
+*opened*, not that a query was *sent*. A real app opens once at startup and
+reuses, so subsequent queries raise no event. It still catches files,
+subprocesses, DNS and the first connect. It costs roughly 20% of throughput
+(measured 3040 → 2683 req/s with tracing already on), because the interpreter
+raises these events for every library in the process; `detect_blocking_calls=False`
+turns it off.
+
+#### Three verdicts, and what is deliberately *not* claimed
+
+The frontend folds the three streams into three row tags: `⏱ STALLED` (frozen
+right now), `🔥 blocking I/O: <category>` (a forbidden wait, from the listener),
+and `⚙ held the loop <total> ×<n>` (from the timer). The last is **not** called
+"CPU-bound": the absence of a detected wait is not evidence of computation.
+`time.sleep` raises no audit event and leaves no Python frame, so labelling it
+CPU would mislabel the single most common blocking call there is. The inspector
+states the cause is unknown and lists the frames instead.
+
+Timer spans accumulate into a per-request list rather than a max, so a request
+that blocks twice reports the sum and both frames. A watchdog span and a timer
+span covering the same stall are reconciled into one entry, not double-counted.
+
+#### Static complement
+
+Runtime detection only sees code that ran. `pyproject.toml` enables ruff's
+`ASYNC` ruleset, which flags blocking calls inside `async def` at lint time —
+including paths a test run never reaches. The two are complementary: ruff
+catches the unexercised path, the runtime catches the dynamic call ruff cannot
+see.
 
 ### Enable gate
 
@@ -203,6 +277,8 @@ root prefix test. Without it, one request in a real project produced 1241 nodes.
 | `identity.py` | trace-id contextvar, pure-ASGI `TraceMiddleware`, task factory |
 | `monitor.py` | `sys.monitoring` global-event registration, filename-scoped self-pruning, per-task/thread call stacks |
 | `threadpool.py` | AnyIO `CapacityLimiter` poller → `pool_sample` events |
+| `watchdog.py` | Loop heartbeat + off-loop detector thread → `loop_stalled` / `loop_unstalled` |
+| `blockingcalls.py` | `sys.addaudithook` listener → `blocking_call` events |
 | `app.py` | `visualize()` — wires everything, mounts `/_viz`, serves the WebSocket |
 | `static/` | `index.html` + `dashboard.js` — the prebuilt canvas SPA |
 
@@ -293,15 +369,18 @@ issues requests to the app; traffic is driven externally (curl, httpx,
   untraced" instead of a confident glow.
 - **Suspended nodes** are dimmed, tagged ⏸, and connect to their parent with a
   faint dashed edge ("parked").
-- **Blocking (EVENT LOOP zone)**: detection is retrospective — no event fires
-  while the loop is frozen, so `loop_blocked` (span start) and `loop_unblocked`
-  (span end) only arrive together at the end. On `loop_blocked` the loop spine
-  overpaints red with "🔥 BLOCKED by `<qualname>` (Ns)" and the node glows red
-  for a short **real-time** window (clamped by the span length), independent of
-  the playback clock so it's visible in both live and step mode. The affected
-  request also gets a **durable** "🔥 blocked" tag next to its runtime state
-  that persists through DONE, so a finished request still records that it froze
-  the loop. This surfaces sync/CPU work stalling every other request.
+- **Blocking (EVENT LOOP zone)**: three event streams, three durable row tags.
+  `loop_stalled` puts the row in a `STALLED` runtime state while the freeze is
+  live; `blocking_call` adds `🔥 blocking I/O: <category>`; `loop_blocked` /
+  `loop_unblocked` accumulate into a `blockSpans` list rendered as
+  `⚙ held the loop 1.01s ×2`. The tags persist through DONE, so a finished
+  request still records that it froze the loop. Spans **accumulate** rather than
+  keeping the maximum, and a watchdog span overlapping a timer span for the same
+  freeze is reconciled into one entry instead of being counted twice. The
+  offending node glows red for a short **real-time** window (clamped by the span
+  length), independent of the playback clock, so it is visible in live and step
+  mode alike. Per-frame detail — every span, its frame and its duration — lives
+  in the inspector card rather than on the row, which stays terse.
 - **Threadpool zone**: the whole zone means "on a worker thread", so the
   per-node "⇢ pool" stub is suppressed there; the worker-token grid
   (`borrowed/total`, filled cells) lives in the zone header.
@@ -399,4 +478,18 @@ disables tracing (no leaked callbacks or DISABLE state).
   surfaces this with a header banner when `WEB_CONCURRENCY` or
   `UVICORN_WORKERS` > 1 is detected. **Recommendation:** run a single worker
   (`uvicorn examples.demo:app`) during development.
+- **The watchdog cannot reach the browser during a freeze.** The WebSocket send
+  runs on the loop that is stuck, so `loop_stalled` queues behind the stall and
+  arrives only once the loop recovers. It logs the stall and its stack from its
+  own thread immediately as the workaround.
+- **The blocking-call listener misses pooled queries.** Python's audit events
+  announce a connection being *opened*, not a query being *sent*, so an app that
+  opens once and reuses raises no event per query. Files, subprocesses, DNS and
+  the first connect are still caught. The hook also costs ~20% of throughput
+  (3040 → 2683 req/s with tracing already on) because the interpreter raises
+  these events for the whole process; `detect_blocking_calls=False` disables it.
+- **`⚙ held the loop` does not identify a cause.** The timer knows a frame ran
+  long, not why. No audit event fired is not proof of computation — `time.sleep`
+  raises none — so the verdict deliberately stops at "held the loop" and lists
+  the frames instead of guessing "CPU-bound".
 

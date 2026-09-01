@@ -21,10 +21,15 @@ function harness() {
   let clock = 0;
   const els = {};
   let texts = [];
+  let placed = [];
   const ctx = new Proxy({}, {
     get(t, p) {
       if (p === "measureText") return () => ({ width: 10 });
-      if (p === "fillText") return (s) => texts.push(String(s));
+      if (p === "fillText")
+        return (s, x, y) => {
+          texts.push(String(s));
+          placed.push({ s: String(s), x: Math.round(x), y: Math.round(y) });
+        };
       return p in t ? t[p] : () => {};
     },
     set(t, p, v) { t[p] = v; return true; },
@@ -64,9 +69,10 @@ function harness() {
     frame: (evs) => ws.onmessage({ data: JSON.stringify({ events: evs }) }),
     tick(seconds) {
       const n = Math.round((seconds * 1000) / FRAME_MS);
-      for (let i = 0; i < n; i++) { clock += FRAME_MS; texts = []; if (rafCb) rafCb(); }
+      for (let i = 0; i < n; i++) { clock += FRAME_MS; texts = []; placed = []; if (rafCb) rafCb(); }
     },
     drawn: () => texts.slice(),
+    at: (label) => placed.find((e) => e.s === label) || null,
     has: (frag) => texts.some((t) => t.includes(frag)),
     loopRows() {
       const line = texts.find((t) => t.includes("shown"));
@@ -328,6 +334,208 @@ check("a STALE holder claim does NOT outrank a live offload", () => {
     throw new Error("a stale holder claim won over a live offload");
   if (!h.has("WAITING · worker"))
     throw new Error("expected WORKER, drawn: " + h.drawn().join(" | "));
+});
+
+check("a live stall paints the loop spine and names the culprit", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/freeze", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "freeze"),
+    ev(T0 + 0.10, "loop_stalled", {
+      qualname: "library_call",
+      node_id: 1,
+      detected_after_ms: 120,
+      stack: [
+        { qualname: "freeze", file: "/app/main.py", line: 10 },
+        { qualname: "library_call", file: "/app/main.py", line: 20 },
+        { qualname: "Session.request", file: "/venv/lib/python3.12/site-packages/requests/sessions.py", line: 500 },
+      ],
+    }),
+  ]);
+  h.tick(1.5);
+  if (!h.has("LOOP STALLED")) throw new Error("no stall shown: " + h.drawn().join(" | "));
+  if (!h.has("library_call")) throw new Error("culprit not named");
+  // the deepest frame says WHAT it is stuck in, even though it is library code
+  if (!h.has("Session.request")) throw new Error("deepest frame not shown");
+});
+
+check("the stall clears when the loop recovers", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/freeze", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "freeze"),
+    ev(T0 + 0.10, "loop_stalled", { qualname: "library_call", node_id: 1, stack: [] }),
+  ]);
+  h.tick(1.2);
+  if (!h.has("LOOP STALLED")) throw new Error("precondition: no stall shown");
+  h.frame([ev(T0 + 0.60, "loop_unstalled", { duration_ms: 500 })]);
+  h.tick(2);
+  if (h.has("LOOP STALLED")) throw new Error("stall outlived loop_unstalled");
+});
+
+check("a fast blocking call is verdicted as blocking I/O, with no timing", () => {
+  // No loop_blocked at all here -- the call was too fast to time. The verdict
+  // comes from WHAT the call was, which is the whole point.
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/w", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "handler"),
+    ev(T0 + 0.002, "blocking_call", {
+      category: "database", audit_event: "sqlite3.connect",
+      detail: ":memory:", node_id: 1, qualname: "handler",
+    }),
+    ev(T0 + 0.01, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.011, "request_end", { status: 200, duration_ms: 11 }),
+  ]);
+  h.tick(2);
+  if (!h.has("blocking I/O")) {
+    throw new Error("no I/O verdict: " + h.drawn().join(" | "));
+  }
+  if (!h.has("database")) throw new Error("category not shown");
+  if (h.has("held the loop")) throw new Error("must not also report an unknown cause");
+});
+
+check("a long hold with no detected wait is reported WITHOUT guessing a cause", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/w", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "crunch"),
+    ev(T0 + 0.001, "loop_blocked", { node_id: 1, qualname: "crunch", duration_ms: 300 }),
+    ev(T0 + 0.301, "loop_unblocked", { node_id: 1, qualname: "crunch", duration_ms: 300 }),
+    ev(T0 + 0.31, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.32, "request_end", { status: 200, duration_ms: 320 }),
+  ]);
+  h.tick(3);
+  // Must NOT claim "CPU-bound": time.sleep raises no audit event and leaves no
+  // Python frame, so no-evidence cannot be read as proof of computation.
+  if (!h.has("held the loop")) {
+    throw new Error("no hold reported: " + h.drawn().join(" | "));
+  }
+  if (h.has("CPU-bound")) throw new Error("must not claim a cause it cannot know");
+  if (h.has("blocking I/O")) throw new Error("no evidence of I/O; must not claim it");
+});
+
+check("when both are present, I/O wins the verdict", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/w", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "handler"),
+    ev(T0 + 0.002, "blocking_call", {
+      category: "socket", audit_event: "socket.connect",
+      detail: "", node_id: 1, qualname: "handler",
+    }),
+    ev(T0 + 0.002, "loop_blocked", { node_id: 1, qualname: "handler", duration_ms: 400 }),
+    ev(T0 + 0.402, "loop_unblocked", { node_id: 1, qualname: "handler", duration_ms: 400 }),
+    ev(T0 + 0.41, "request_end", { status: 200, duration_ms: 410 }),
+  ]);
+  h.tick(3);
+  if (!h.has("blocking I/O")) throw new Error("expected the I/O verdict");
+  if (h.has("held the loop")) throw new Error("I/O evidence must take precedence");
+});
+
+check("a stall marks the guilty ROW, not just the top of the zone", () => {
+  // The banner used to be drawn at the top of the spine, which is exactly
+  // where the FIRST row prints its own "#id STATE" header — the two collided
+  // into unreadable text. Worse, it described whichever request was stuck even
+  // though that row might be scrolled out of sight.
+  const h = harness();
+  h.tick(1);
+  const A = (t, k, x) => ({ seq: seq++, t, kind: k, trace_id: "a".repeat(16), task_id: 1, name: "f", extra: x });
+  const B = (t, k, x) => ({ seq: seq++, t, kind: k, trace_id: "b".repeat(16), task_id: 1, name: "f", extra: x });
+  const call = (f) => (t, n, p, ex, q) =>
+    f(t, "call_enter", { node_id: n, parent_id: p, qualname: q, file: "d.py", line: 1,
+                         is_async: ex === "event_loop", execution: ex });
+  h.frame([
+    A(T0, "request_start", { method: "GET", path: "/async", request_id: null }),
+    call(A)(T0 + 0.001, 1, null, "event_loop", "async_ep"),
+    A(T0 + 0.002, "suspend", { node_id: 1, awaiting: "db_fetch" }),
+    B(T0 + 0.003, "request_start", { method: "GET", path: "/blocking", request_id: null }),
+    call(B)(T0 + 0.004, 2, null, "event_loop", "blocking_ep"),
+    B(T0 + 0.005, "loop_stalled", { qualname: "blocking_ep", node_id: 2, stack: [] }),
+  ]);
+  h.tick(1.5);
+
+  if (!h.has("STALLED")) throw new Error("no stall shown at all");
+  if (!h.has("blocking_ep")) throw new Error("the frozen function is not named");
+  // the innocent request must still read as waiting, not stalled
+  if (!h.has("WAITING")) {
+    throw new Error("the other request lost its state: " + h.drawn().join(" | "));
+  }
+
+  // and it clears on the right row when the loop recovers
+  h.frame([B(T0 + 1.0, "loop_unstalled", { duration_ms: 995 })]);
+  h.tick(2);
+  if (h.has("⏱ STALLED")) throw new Error("row still marked stalled after recovery");
+});
+
+check("a collapsed row shows the live frame, then collapses back when done", () => {
+  // Pinning the frames that blocked into the finished row was tried and
+  // reverted: it left wide nodes hanging around, colliding with the row's own
+  // tag, for information that belongs in the inspector.
+  const h = harness();
+  h.tick(1);
+  const nodes = () =>
+    h.drawn().filter((t) => /^(GET |async_ep|blocking_function)/.test(t));
+
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/async", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "async_ep"),
+    enter(T0 + 0.20, 2, 1, "event_loop", "blocking_function"),
+  ]);
+  h.tick(1.5);
+  if (!nodes().includes("blocking_function")) {
+    throw new Error("running row must show the live frame: " + nodes().join(","));
+  }
+
+  h.frame([
+    ev(T0 + 0.20, "loop_blocked", { node_id: 2, qualname: "blocking_function", duration_ms: 505 }),
+    ev(T0 + 0.705, "loop_unblocked", { node_id: 2, qualname: "blocking_function", duration_ms: 505 }),
+    ev(T0 + 0.706, "call_exit", { node_id: 2 }),
+    ev(T0 + 0.72, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.73, "request_end", { status: 200, duration_ms: 730 }),
+  ]);
+  h.tick(6);
+  const after = nodes();
+  if (after.length !== 1 || !after[0].startsWith("GET ")) {
+    throw new Error("finished row should collapse to the request: " + after.join(","));
+  }
+  if (!h.drawn().some((t) => t.includes("held the loop"))) {
+    throw new Error("finished row lost its hold summary");
+  }
+});
+
+check("a stall and its later loop_blocked are ONE span, not two", () => {
+  // The watchdog opens a span while the frame is still stuck; loop_blocked
+  // closes it out afterwards. Appending both listed a single blocking call
+  // twice -- once as "still running", once with its duration -- and inflated
+  // the span count past the number of calls actually made.
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/async", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "async_ep"),
+    enter(T0 + 0.20, 2, 1, "event_loop", "blocking_function"),
+    ev(T0 + 0.205, "loop_stalled", { qualname: "blocking_function", node_id: 2, stack: [] }),
+    ev(T0 + 0.70, "loop_unstalled", { duration_ms: 500 }),
+    ev(T0 + 0.20, "loop_blocked", { node_id: 2, qualname: "blocking_function", duration_ms: 505 }),
+    ev(T0 + 0.705, "loop_unblocked", { node_id: 2, qualname: "blocking_function", duration_ms: 505 }),
+    ev(T0 + 0.706, "call_exit", { node_id: 2 }),
+    ev(T0 + 0.72, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.73, "request_end", { status: 200, duration_ms: 730 }),
+  ]);
+  h.tick(6);
+  // one blocking call was made, so the row must not claim two
+  if (h.drawn().some((t) => t.includes("×2"))) {
+    throw new Error("one call counted twice: " + h.drawn().join(" | "));
+  }
+  if (!h.drawn().some((t) => t.includes("held the loop"))) {
+    throw new Error("the hold was not reported at all");
+  }
 });
 
 console.log(failures === 0 ? "\nall zone tests passed" : `\n${failures} failure(s)`);

@@ -8,6 +8,41 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Blocking detection v2 — two more detectors alongside the timer.** The
+  original threshold timer answers only "did a frame run long?", which is both
+  retrospective (a server hung *right now* shows nothing) and duration-based (a
+  5ms `open()` on the loop is a real bug no threshold catches). Two detectors
+  close those gaps:
+  - `watchdog.py` — a 50ms heartbeat on the loop plus an **off-loop daemon
+    thread** that watches it. When the heartbeat misses `stall_ms` (default 250,
+    `stall_ms=0` disables), the loop is captured with `sys._current_frames()` and
+    a `loop_stalled` event is emitted, blaming the deepest in-root frame in the
+    stack. This is the only detector that catches a request which **never
+    returns**. It also writes the stall and its stack to the log immediately from
+    its own thread, because the WebSocket send runs on the loop that is stuck.
+  - `blockingcalls.py` — a `sys.addaudithook` listener that reports a
+    `blocking_call` whenever the loop thread opens a file, connects a socket,
+    resolves DNS, connects to a database, or spawns a process during a traced
+    request. **No threshold**: a 1ms blocking read is reported. Own-package
+    calls, imports, worker threads and untraced calls are filtered out, and the
+    dedup set is bounded at 4096 entries. On by default;
+    `detect_blocking_calls=False` turns it off (it costs ~20% throughput).
+  - ruff's `ASYNC` ruleset is enabled as the static complement, catching blocking
+    calls in `async def` on code paths a run never reaches.
+- **Three honest verdicts on the row**: `⏱ STALLED` (frozen right now),
+  `🔥 blocking I/O: <category>` (a forbidden wait at any speed), and
+  `⚙ held the loop 1.01s ×2` (ran long, cause unknown). The last is deliberately
+  *not* labelled "CPU-bound" — no audit event fired is not evidence of
+  computation, and `time.sleep` raises none. Per-span detail lives in the
+  inspector card so the row stays terse.
+- **Demo endpoints for every case** in `examples/demo.py`: `/offloaded` (the
+  correct way to call blocking code from async), `/fast_db` (listener-only — a
+  1-2ms connect no timer could catch) and `/cpu` (pure computation, which draws
+  the *same* row as `/blocking` — the demonstration that "held the loop" names a
+  symptom, not a cause), alongside the existing `/async`, `/sync` and
+  `/blocking`. One endpoint per distinct verdict, none duplicated; each docstring
+  names the detector that should fire.
+
 - **Multi-worker awareness** (Phase 3, plan task 9): when `WEB_CONCURRENCY`
   or `UVICORN_WORKERS` is > 1, the visualizer logs a startup warning and the
   dashboard shows a persistent header banner — "⚠ worker PID of multiple —
@@ -224,7 +259,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   `gather(run_in_threadpool(a), b())` used to read "WAITING · worker" while the
   loop was demonstrably busy with that same request. A fresh loop-holder claim
   now wins, and a live offload beats only a stale one.
-
+- **Blocking spans accumulate instead of overwriting.** A request that blocks
+  twice reports the sum and both frames; a watchdog span and a timer span
+  covering the same freeze are reconciled into one entry rather than
+  double-counted.
 - **Overlay panels share one right-side column.** The legend and the request
   inspector now live in a flex column pinned to the right edge — legend at the
   top, inspector at the bottom (it moved from bottom-left). Each shrinks into
