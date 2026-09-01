@@ -452,10 +452,13 @@
       children: [],
       isRoot: true,
     };
-    // Carry over a blocked tag recorded before this trace could be admitted.
-    if (blockedBefore.has(traceId)) {
+    // Carry over blocking recorded before this trace could be admitted.
+    var pre = blockedBefore.get(traceId);
+    if (pre) {
       b.blocked = true;
-      b.blockedMs = blockedBefore.get(traceId);
+      b.blockedMs = pre.ms;
+      b.blockCount = pre.count;
+      b.blockSpans = pre.spans;
       blockedBefore.delete(traceId);
     }
     branches.set(traceId, b);
@@ -652,6 +655,11 @@
       if (ev.kind === "loop_stalled") {
         var stk = extra.stack || [];
         var sb2 = branches.get(traceId);
+        // A stall reported against an already-finished request is not this
+        // request's stall: the backend can only attribute to whatever frame
+        // last ran, and a freeze in untraced code carries no live owner. Brand
+        // nothing rather than brand the wrong row.
+        if (sb2 && sb2.done) sb2 = null;
         if (sb2) {
           // A stall is a hold in progress; record it as a span too, so the
           // card lists it even if loop_blocked never lands (a hang has no end).
@@ -677,6 +685,11 @@
         }
         loopStalled = {
           qualname: extra.qualname || "?",
+          // Carried so drawNode can put the hot ring on the frame that is
+          // frozen RIGHT NOW. Omitting it made that comparison test against
+          // `undefined` on every frame, so the live indicator this event
+          // exists to drive never once fired.
+          node_id: extra.node_id != null ? extra.node_id : null,
           deepest: stk.length ? stk[stk.length - 1].qualname : null,
           stack: stk,
           sinceT: ev.t,
@@ -730,8 +743,24 @@
           }
         } else {
           // Trace blocked while still over the row cap (not admitted yet).
-          // Stash it so the tag survives to when it IS admitted.
-          blockedBefore.set(traceId, Math.max(dur, blockedBefore.get(traceId) || 0));
+          // Stash it so the tag survives to when it IS admitted — with the
+          // same shape the admitted path uses. Keeping only a max here made a
+          // late-admitted row report one span and its card report none, so the
+          // row and the card disagreed about the same request.
+          var pre = blockedBefore.get(traceId);
+          if (!pre) {
+            pre = { ms: 0, count: 0, spans: [] };
+            blockedBefore.set(traceId, pre);
+          }
+          pre.ms += dur;
+          pre.count++;
+          if (pre.spans.length < 32) {
+            pre.spans.push({
+              qualname: extra.qualname || "?",
+              ms: dur,
+              nodeId: extra.node_id,
+            });
+          }
         }
         if (nb) {
           nb.blocking = true;      // hot ring, expires on a real-time timer
@@ -757,6 +786,7 @@
           bo.offloadCount++;
           bo._offloadStartT.set(extra.node_id, ev.t);
           var no = bo.nodesById.get(extra.node_id);
+          if (no) no.offloaded = true;
           // Only surface work belonging to a LOOP-zone request. For a sync
           // handler the offloaded frame IS the request, already shown as its
           // own row in the pool zone — a second entry would just duplicate it.
@@ -771,11 +801,6 @@
             });
           }
         }
-      }
-      if (ev.kind === "offload_start") {
-        var b6 = branches.get(traceId);
-        var n6 = b6 && b6.nodesById.get(extra.node_id);
-        if (n6) n6.offloaded = true;
         continue;
       }
 
@@ -783,6 +808,8 @@
         var be = branches.get(traceId);
         if (be) {
           be.liveOffloads = Math.max(0, be.liveOffloads - 1);
+          var ne = be.nodesById.get(extra.node_id);
+          if (ne) ne.offloaded = false;
           var st = be._offloadStartT.get(extra.node_id);
           if (st != null) {
             be.offloadMs += Math.max(0, Math.round((ev.t - st) * 1000));
@@ -790,11 +817,6 @@
           }
         }
         activeOffloads.delete(traceId + ":" + extra.node_id);
-      }
-      if (ev.kind === "offload_end") {
-        var b7 = branches.get(traceId);
-        var n7 = b7 && b7.nodesById.get(extra.node_id);
-        if (n7) n7.offloaded = false;
         continue;
       }
     }
@@ -1354,7 +1376,7 @@
     if (node.blocking && node.blockUntil && performance.now() > node.blockUntil) {
       node.blocking = false;
     }
-    if (loopStalled && node.id === loopStalled.node_id) {
+    if (loopStalled && loopStalled.node_id != null && node.id === loopStalled.node_id) {
       node.blocking = true; // frozen right now — same hot ring as a blocking span
     }
     if (node.wasBlocking && !node.blocking) {

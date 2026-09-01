@@ -218,11 +218,23 @@ class Watchdog:
     # -- events -----------------------------------------------------------
 
     def _push(self, kind: str, t: float, extra: dict) -> None:
+        # Attribution comes from ONE atomic snapshot, not from reading the
+        # monitor's per-frame fields one at a time from this thread. Two
+        # separate reads could straddle a frame boundary and pair one frame's
+        # node with another's trace; and before `_loop_close` learned to clear
+        # the trace, an unowned freeze inherited whichever request last ran an
+        # in-root frame — routinely one that had already finished.
+        #
+        # `None` here is the correct answer for a freeze in library or
+        # framework code: the event still carries the stack, which is what
+        # actually identifies the culprit, and no request gets blamed for a
+        # stall that is not provably its own.
         trace = node = None
         try:
             if self.monitor is not None:
-                trace = self.monitor._active_trace
-                node = self.monitor._active_node
+                snap = self.monitor.active_frame()
+                if snap is not None:
+                    node, trace, _qual = snap
         except Exception:
             pass
         try:

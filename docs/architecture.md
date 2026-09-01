@@ -128,6 +128,19 @@ at shutdown.
 The watchdog is the only detector that sees a request which **never returns** —
 the timer needs a `PY_RETURN` that will never arrive.
 
+**Attribution is a snapshot, and "nobody" is a valid answer.** The watchdog runs
+on its own thread, so it must not read the monitor's five `_active_*` fields:
+those are written one at a time, and a reader on another thread can catch a mix
+of two frames. `Monitor.active_frame()` returns a single tuple
+`(node_id, trace_id, qualname)` that is replaced by whole-object assignment —
+atomic under the GIL — so a cross-thread reader sees one frame whole or `None`.
+`_clear_active()` wipes **every** field when a frame closes; clearing only the
+node and timestamp left `_active_trace` pointing at the last request that ran
+in-root code for the rest of the process, so a freeze in library code was
+routinely blamed on a request that had already finished. `None` is now the
+honest report for such a freeze: the event still carries the stack, which is
+what identifies the culprit, and no innocent row is branded.
+
 Its one structural limit: **it cannot reach the browser during the freeze.** The
 WebSocket send runs on the loop that is stuck, so the event queues behind the
 stall and arrives only once the loop recovers. It therefore also writes the
@@ -141,6 +154,13 @@ DNS lookup, DB connect and subprocess spawn in the process. If one fires while
 the loop thread is inside a traced request, that is a blocking wait by
 definition — **no threshold involved** — and a `blocking_call` is emitted with a
 category (`file`, `network`, `dns`, `database`, `process`) and a short detail.
+
+**One hook per process, not per app.** `sys.addaudithook` is permanent — CPython
+cannot remove a hook — so installing one per `BlockingCallDetector` leaked a
+callback on every app startup, each firing on every audited event thereafter
+(measured: four apps in one interpreter left four hooks). A single dispatcher is
+installed once and fans out to a `WeakSet` of live detectors, so an app dropped
+without a clean shutdown takes its detector with it.
 
 Four filters keep it quiet: its own package is skipped, worker threads are
 skipped (blocking there is correct), calls outside an active trace are skipped,

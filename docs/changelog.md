@@ -170,6 +170,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A freeze in untraced code no longer blames an innocent request.**
+  `Monitor._loop_close` cleared only `_active_node`/`_active_since`, so
+  `_active_trace` kept pointing at the last request that ran in-root code for
+  the rest of the process. A stall in library or framework code inherited that
+  trace — usually a request that had already finished — and the dashboard
+  branded that row. Every field is now cleared together, and an unowned stall
+  reports `trace_id: None` while still carrying the stack that identifies it.
+- **Cross-thread reads of the monitor's frame state are now a single atomic
+  snapshot.** `monitor.py` documents the `_active_*` fields as loop-thread-only
+  and lock-free; the watchdog read two of them from its own thread, which could
+  pair one frame's node with another's trace. `Monitor.active_frame()` returns
+  one tuple, replaced by whole-object assignment.
+- **The live "this frame is frozen right now" ring never once appeared.** The
+  `loop_stalled` handler built its state object without copying `node_id`
+  across, so `drawNode`'s `node.id === loopStalled.node_id` compared against
+  `undefined` on every frame. The backend had been sending the id all along.
+- **A live offload no longer masks a request executing on the loop** — see the
+  entry under Changed.
+- **`sys.addaudithook` is installed once per process instead of once per app.**
+  Audit hooks cannot be removed, so every app startup leaked another permanent
+  callback firing on every audited event. One dispatcher now fans out to a
+  weak registry of live detectors.
+- **Blocking recorded before a row is admitted keeps the same shape as after.**
+  The pre-admission stash kept only the largest span and never populated
+  `blockCount`/`blockSpans`, so a row admitted late could claim it held the
+  loop while its inspector card listed no spans at all.
+- **The two duplicated `offload_start` / `offload_end` handler pairs are merged**
+  — they worked, but an edit to one would have missed the other.
+
 - **Requests now appear automatically; auto-playback was completely stalled.**
   `render()` runs from page load, so `advancePlayback()` reached its idle branch
   long before any event existed — where `maxSeenT` is still `0` and `virtualT`

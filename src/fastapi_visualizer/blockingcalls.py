@@ -42,6 +42,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 
 from . import identity
@@ -77,13 +78,52 @@ _MAX_DETAIL = 120
 # call already reported for a still-open request might be reported once more.
 _MAX_SEEN = 4096
 
+# ---------------------------------------------------------------------------
+# One audit hook per PROCESS, not one per app.
+#
+# `sys.addaudithook` is permanent — CPython offers no way to remove a hook. A
+# per-detector hook therefore leaked one more permanent callback on every app
+# startup, each firing on every audited event for the rest of the process.
+# Measured before this: four apps in one interpreter left four hooks; the test
+# suite starts far more than four. So a single dispatcher is installed once and
+# fans out to whichever detectors are currently live.
+#
+# The registry is weak: an app dropped without a clean shutdown takes its
+# detector with it instead of pinning it forever. Live apps hold a strong
+# reference in `app.state._viz["blocking_calls"]`.
+_HOOK_LOCK = threading.Lock()
+_HOOK_INSTALLED = False
+_ACTIVE: "weakref.WeakSet[BlockingCallDetector]" = weakref.WeakSet()
+
+
+def _dispatch(event: str, args) -> None:
+    # Snapshot: a detector may install or uninstall while an event is in
+    # flight, and a WeakSet can drop entries mid-iteration.
+    for detector in tuple(_ACTIVE):
+        try:
+            detector._hook(event, args)
+        except Exception:
+            pass
+
+
+def _ensure_hook() -> bool:
+    global _HOOK_INSTALLED
+    with _HOOK_LOCK:
+        if _HOOK_INSTALLED:
+            return True
+        try:
+            sys.addaudithook(_dispatch)
+        except Exception:
+            return False
+        _HOOK_INSTALLED = True
+        return True
+
 
 class BlockingCallDetector:
     def __init__(self, monitor=None) -> None:
         self.monitor = monitor
         self.enabled = False
         self.loop_tid: int | None = None
-        self._hook_installed = False
         # Emitting an event can itself trip audited operations; without this a
         # single open() could recurse until the stack blows.
         self._local = threading.local()
@@ -96,21 +136,19 @@ class BlockingCallDetector:
 
     def install(self, loop_tid: int) -> None:
         self.loop_tid = loop_tid
-        self.enabled = True
         self._seen.clear()
-        if self._hook_installed:
-            return  # audit hooks are permanent; re-arming the flag is enough
-        try:
-            sys.addaudithook(self._hook)
-            self._hook_installed = True
-        except Exception:
+        if not _ensure_hook():
             self.enabled = False
+            return
+        self.enabled = True
+        _ACTIVE.add(self)
 
     def uninstall(self) -> None:
-        # The hook stays registered (CPython has no way to remove one), so make
-        # it a no-op instead.
+        # The process-wide hook stays registered (CPython has no way to remove
+        # one), but this detector stops being dispatched to at all.
         self.enabled = False
         self._seen.clear()
+        _ACTIVE.discard(self)
 
     # -- the hook ---------------------------------------------------------
 
@@ -181,11 +219,16 @@ class BlockingCallDetector:
         return "__pycache__" in path
 
     def _emit(self, category: str, event: str, detail: str, trace: str) -> None:
+        # Same thread as the monitor (the hook returns early off-loop, see the
+        # loop_tid guard), so this read is safe either way — but it goes
+        # through the same snapshot the watchdog uses, so there is one way to
+        # ask "what is the loop running" and no unsafe pattern to copy.
         node = qual = None
         try:
             if self.monitor is not None:
-                node = self.monitor._active_node
-                qual = self.monitor._active_qual
+                snap = self.monitor.active_frame()
+                if snap is not None:
+                    node, _trace, qual = snap
         except Exception:
             pass
         try:

@@ -132,14 +132,22 @@ class Monitor:
         # longer than `slow_ms` without yielding, the interval was a blocking
         # span (it froze the single loop thread). Worker-thread frames are
         # never tracked here — blocking on a worker is expected, that's the
-        # whole point of the threadpool. Loop-thread-only, so these fields are
-        # touched by exactly one thread and need no lock.
+        # whole point of the threadpool. The five `_active_*` fields are
+        # written and read ONLY on the loop thread, so they need no lock.
         self._slow = max(0.0, slow_ms / 1000.0)
         self._active_node: int | None = None
         self._active_since: float | None = None
         self._active_trace: str | None = None
         self._active_task: int | None = None
         self._active_qual: str = ""
+
+        # The watchdog runs on its OWN thread and needs to know which frame the
+        # loop is stuck in. It must not read the five fields above: they are
+        # written one at a time, so a reader on another thread can catch a mix
+        # of two different frames' values. This single tuple is replaced by
+        # whole-object assignment instead — atomic under the GIL — so a reader
+        # sees one frame's values or None, never a blend. See active_frame().
+        self._active: tuple[int, str | None, str] | None = None
 
     def _in_root(self, filename: str) -> bool:
         if filename.startswith(_PKG_DIR):
@@ -209,8 +217,7 @@ class Monitor:
         except Exception:
             pass
         self._offloaded.clear()
-        self._active_node = None
-        self._active_since = None
+        self._clear_active()
         self.tool_id = None
         self.enabled = False
 
@@ -255,6 +262,32 @@ class Monitor:
 
     # -- blocking detection (loop thread only) ---------------------------
 
+    def _clear_active(self) -> None:
+        """Forget the currently-open loop frame, every field of it.
+
+        Clearing only `_active_node`/`_active_since` used to leave
+        `_active_trace` pointing at the last request that ran an in-root frame,
+        for the rest of the process. Anything reading it later — the watchdog,
+        reporting a freeze that happened in untraced code — attributed that
+        freeze to a request that had often already finished.
+        """
+        self._active_node = None
+        self._active_since = None
+        self._active_trace = None
+        self._active_task = None
+        self._active_qual = ""
+        self._active = None
+
+    def active_frame(self) -> tuple[int, str | None, str] | None:
+        """`(node_id, trace_id, qualname)` for the frame on the loop, or None.
+
+        Safe to call from another thread — see `_active`. None is a meaningful
+        answer, not a failure: it means no in-root frame is open, so a freeze
+        happening now belongs to library or framework code and cannot honestly
+        be pinned on any request.
+        """
+        return self._active
+
     def _loop_close(self, now: float) -> None:
         """Close the current loop-frame interval; flag it if it ran too long.
 
@@ -266,8 +299,10 @@ class Monitor:
         """
         node = self._active_node
         since = self._active_since
-        self._active_node = None
-        self._active_since = None
+        trace = self._active_trace
+        task = self._active_task
+        qual = self._active_qual
+        self._clear_active()
         if node is None or since is None or self._slow <= 0:
             return
         dur = now - since
@@ -275,7 +310,7 @@ class Monitor:
             return
         extra = {
             "node_id": node,
-            "qualname": self._active_qual,
+            "qualname": qual,
             "duration_ms": round(dur * 1000),
         }
         try:
@@ -283,9 +318,9 @@ class Monitor:
                 Event(
                     t=since,
                     kind=LOOP_BLOCKED,
-                    trace_id=self._active_trace,
-                    task_id=self._active_task,
-                    name=self._active_qual,
+                    trace_id=trace,
+                    task_id=task,
+                    name=qual,
                     extra=extra,
                 )
             )
@@ -293,9 +328,9 @@ class Monitor:
                 Event(
                     t=now,
                     kind=LOOP_UNBLOCKED,
-                    trace_id=self._active_trace,
-                    task_id=self._active_task,
-                    name=self._active_qual,
+                    trace_id=trace,
+                    task_id=task,
+                    name=qual,
                     extra=dict(extra),
                 )
             )
@@ -303,11 +338,16 @@ class Monitor:
             pass
 
     def _loop_open(self, node_id: int, now: float, task, qual: str) -> None:
+        trace = identity.current_trace()
         self._active_node = node_id
         self._active_since = now
         self._active_task = id(task) if task is not None else None
-        self._active_trace = identity.current_trace()
+        self._active_trace = trace
         self._active_qual = qual
+        # Last, and as one store: a cross-thread reader that catches this
+        # between the assignments above still sees the PREVIOUS frame whole
+        # rather than half of each.
+        self._active = (node_id, trace, qual)
 
     # -- callbacks --------------------------------------------------------
 

@@ -26,6 +26,7 @@ function harness() {
   const els = {};
   let texts = [];
   let placed = [];
+  let strokes = [];
   const ctx = new Proxy({}, {
     get(t, p) {
       if (p === "measureText") return () => ({ width: 10 });
@@ -33,6 +34,9 @@ function harness() {
         texts.push(String(s));
         placed.push({ s: String(s), x: Math.round(x), y: Math.round(y) });
       };
+      // Rings are strokes, not text. Record the colour in force at the moment
+      // of each stroke so a test can ask "was the hot ring painted?".
+      if (p === "stroke" || p === "strokeRect") return () => { strokes.push(t.strokeStyle); };
       return p in t ? t[p] : () => {};
     },
     set(t, p, v) { t[p] = v; return true; },
@@ -72,10 +76,11 @@ function harness() {
     frame: (evs) => ws.onmessage({ data: JSON.stringify({ events: evs }) }),
     tick(seconds) {
       const n = Math.round((seconds * 1000) / FRAME_MS);
-      for (let i = 0; i < n; i++) { clock += FRAME_MS; texts = []; placed = []; if (rafCb) rafCb(); }
+      for (let i = 0; i < n; i++) { clock += FRAME_MS; texts = []; placed = []; strokes = []; if (rafCb) rafCb(); }
     },
     // the row tag, e.g. "⚙ held the loop 0.80s ×2"
     heldTag: () => texts.find((t) => t.indexOf("held the loop") >= 0) || null,
+    stroked: (color) => strokes.indexOf(color) >= 0,
     // the inspector card body
     card: () => el("inspector-body").innerHTML,
     // click the row by the position of a label actually drawn on it
@@ -183,6 +188,47 @@ check("a watchdog stall and the timer span for the SAME frame are one entry", ()
   const card = h.card();
   if (/still running/.test(card))
     throw new Error("inspector still lists the finished span as running: " + card);
+});
+
+// The live "this frame is frozen RIGHT NOW" ring.
+//
+// `drawNode` decides it with `node.id === loopStalled.node_id`, but the
+// loop_stalled handler built `loopStalled` without ever copying node_id across
+// — so that test compared against `undefined` on every frame and the ring had
+// never once been painted, despite the backend sending the id all along.
+const HOT_RING = "#ff6a5f";
+
+function frozenAt(h, extra) {
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/freeze", request_id: null }),
+    enter(T0 + 0.001, 1, null, "freeze_ep"),
+    enter(T0 + 0.01, 2, 1, "library_call"),
+    ev(T0 + 0.30, "loop_stalled", Object.assign({
+      qualname: "library_call",
+      file: "a.py",
+      line: 1,
+      elapsed_ms: 260,
+      stack: [{ qualname: "library_call", file: "a.py", line: 1 }],
+    }, extra)),
+  ]);
+}
+
+check("the frame frozen right now gets the hot ring", () => {
+  const h = harness();
+  h.tick(1);
+  frozenAt(h, { node_id: 2 });
+  h.tick(0.6);
+  if (!h.stroked(HOT_RING))
+    throw new Error("no hot ring painted for the stalled frame");
+});
+
+check("a stall with no node_id rings nothing rather than ringing node 0", () => {
+  const h = harness();
+  h.tick(1);
+  frozenAt(h, {});           // backend could not attribute it to a frame
+  h.tick(0.6);
+  if (h.stroked(HOT_RING))
+    throw new Error("an unattributed stall painted a ring on some node anyway");
 });
 
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
