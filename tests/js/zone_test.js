@@ -97,6 +97,11 @@ function asyncWithOffload(h) {
   h.frame([
     ev(T0, "request_start", { method: "GET", path: "/async", request_id: null }),
     enter(T0 + 0.001, 1, null, "event_loop", "async_ep"),
+    // Measured against the real backend: `await run_in_threadpool(f)` yields
+    // the coroutine BEFORE the worker frame opens, so the suspend always
+    // precedes offload_start. Omitting it left the loop-holder claim standing
+    // and made this fixture describe a stream the monitor never emits.
+    ev(T0 + 0.09, "suspend", { node_id: 1, awaiting: "run_in_threadpool" }),
     enter(T0 + 0.10, 2, 1, "threadpool", "blocking_function"),
     ev(T0 + 0.101, "offload_start", { node_id: 2 }),
   ]);
@@ -104,6 +109,7 @@ function asyncWithOffload(h) {
 function offloadReturns(h) {
   h.frame([
     ev(T0 + 0.40, "offload_end", { node_id: 2 }),
+    ev(T0 + 0.4005, "resume", { node_id: 1 }),
     ev(T0 + 0.401, "call_exit", { node_id: 2 }),
     enter(T0 + 0.41, 3, 1, "event_loop", "serialize"),
     ev(T0 + 0.45, "call_exit", { node_id: 3 }),
@@ -273,6 +279,55 @@ check("a request parked on a worker does not claim the event loop", () => {
   if (!drawn.includes("WAITING · worker")) {
     throw new Error("B should be parked on a worker: " + drawn);
   }
+});
+
+// gather(): one trace, two children, one of each kind
+//
+// `install_task_factory` copies a parent's trace id onto its child tasks, so
+// `gather(run_in_threadpool(a), b())` gives ONE trace a worker-bound child and
+// a loop-bound sibling at the same instant. Checking liveOffloads before the
+// loop-holder claim reported "WAITING · worker" while the loop was
+// demonstrably busy with this very request.
+function gatherChildren(h) {
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/gather", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "gather_ep"),
+    ev(T0 + 0.005, "suspend", { node_id: 1, awaiting: "gather" }),
+    // child A -> worker thread
+    enter(T0 + 0.01, 2, 1, "threadpool", "blocking_child"),
+    ev(T0 + 0.011, "offload_start", { node_id: 2 }),
+    // child B -> genuinely executing on the loop, same trace id
+    enter(T0 + 0.02, 3, 1, "event_loop", "loop_child"),
+  ]);
+}
+
+check("a loop-bound sibling outranks a live offload on the same trace", () => {
+  const h = harness();
+  h.tick(1);
+  gatherChildren(h);
+  h.tick(0.25);
+  if (h.has("WAITING · worker"))
+    throw new Error(
+      "row claims the request is only waiting on a worker, but loop_child is " +
+      "executing on the loop right now: " + h.drawn().join(" | ")
+    );
+  if (!h.has("RUNNING"))
+    throw new Error("expected RUNNING, drawn: " + h.drawn().join(" | "));
+});
+
+check("a STALE holder claim does NOT outrank a live offload", () => {
+  const h = harness();
+  h.tick(1);
+  gatherChildren(h);
+  // Push playback past UNTRACED_AFTER (0.15s) without ending the offload:
+  // "a worker is definitely busy" beats "the loop last touched this trace a
+  // while ago".
+  h.frame([ev(T0 + 1.2, "pool_sample", { borrowed: 1, total: 40, queued: 0 })]);
+  h.tick(2);
+  if (h.has("UNTRACED"))
+    throw new Error("a stale holder claim won over a live offload");
+  if (!h.has("WAITING · worker"))
+    throw new Error("expected WORKER, drawn: " + h.drawn().join(" | "));
 });
 
 console.log(failures === 0 ? "\nall zone tests passed" : `\n${failures} failure(s)`);

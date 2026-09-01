@@ -204,6 +204,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Offloaded work is drawn truthfully: the request parks, a worker runs the
+  call.** An `async def` that calls `run_in_threadpool` no longer migrates its
+  whole row to the THREADPOOL zone — its task is still on the loop, waiting. The
+  row stays in the EVENT LOOP zone, parked, and a separate entry for the
+  offloaded frame appears in the threadpool zone. A row's zone is now decided
+  once, by where the request lives, and never changes.
+- **Offloaded frames get their real parent.** `monitor.py` carries a
+  `_current_node` ContextVar; anyio copies the calling context into the worker
+  thread, so an offloaded frame no longer reports `parent_id: None` and is no
+  longer stranded in the graph.
+- **Library code under a root is excluded from tracing.** A virtualenv inside
+  the project directory used to be traced as application code — 1241 nodes for
+  one request in a real project. `_in_root()` now rejects `sysconfig` library
+  prefixes and any path containing `site-packages` / `dist-packages`.
+- **A live offload no longer hides a request that is running on the loop.** The
+  task factory copies a trace id onto child tasks, so one trace can have a
+  worker-bound child and a loop-bound sibling at once;
+  `gather(run_in_threadpool(a), b())` used to read "WAITING · worker" while the
+  loop was demonstrably busy with that same request. A fresh loop-holder claim
+  now wins, and a live offload beats only a stale one.
+
 - **Overlay panels share one right-side column.** The legend and the request
   inspector now live in a flex column pinned to the right edge — legend at the
   top, inspector at the bottom (it moved from bottom-left). Each shrinks into

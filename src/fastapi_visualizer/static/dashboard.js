@@ -964,16 +964,32 @@
   function branchState(b) {
     if (b.done) return "DONE";
     if (b.zone === "pool") return b.stack.length ? "RUNNING" : "WAITING";
+
+    // Order matters, and it is not obvious. One trace can be BOTH offloading
+    // and running on the loop at the same time: the task factory copies a
+    // parent's trace id onto its child tasks, so `gather(run_in_threadpool(a),
+    // b())` gives one trace a worker-bound child and a loop-bound sibling.
+    // Checking liveOffloads first reported "WAITING · worker" while the loop
+    // was demonstrably busy with this very request — the exact untruth this
+    // zone work set out to remove.
+    //
+    // So a FRESH loop-holder claim wins: if the loop produced an in-root event
+    // for this trace within UNTRACED_AFTER, the loop is running it, full stop.
+    var holding = loopHolder === b.traceId;
+    var stale =
+      virtualT !== null && b.lastEventT && virtualT - b.lastEventT > UNTRACED_AFTER;
+    if (holding && !stale) return "RUNNING";
+
     // Parked at an await whose work is on a worker thread. Still WAITING as
     // far as the loop is concerned (the loop is free either way) — but worth
     // distinguishing from waiting on i/o, because a worker is busy for it.
+    // This also outranks a STALE holder claim: "a worker is definitely busy"
+    // beats "the loop last touched this trace a while ago".
     if (b.liveOffloads > 0) return "WORKER";
-    if (loopHolder === b.traceId) {
-      if (virtualT !== null && b.lastEventT && virtualT - b.lastEventT > UNTRACED_AFTER) {
-        return "UNTRACED";
-      }
-      return "RUNNING";
-    }
+
+    // Held the loop, but has gone quiet — the loop is off in code outside the
+    // configured roots, so we cannot claim this frame is the one running.
+    if (holding) return "UNTRACED";
     return "WAITING";
   }
 

@@ -178,6 +178,22 @@ runs with **no current asyncio task** is executing on an AnyIO worker thread
 `call_enter`/`call_exit` also fire `offload_start`/`offload_end`. This is
 necessarily **best-effort** (see Known limitations).
 
+The same rule applies **mid-request**: an `async def` endpoint that calls
+`run_in_threadpool(...)` runs that callable with no current task, so it is
+reported as offloaded too. Its `parent_id` used to come back `None` — the worker
+thread has its own call stack, so the caller's frame was not on it, and the node
+was stranded. `monitor.py` therefore carries a `_current_node` **ContextVar**;
+anyio copies the calling context into the worker, so the offloaded frame reads
+its true parent from there. That is what lets the dashboard draw the honest
+picture: the **request parks on the loop** while a **worker runs the call**,
+rather than the whole request appearing to migrate.
+
+`_in_root()` also excludes library code that happens to live under a root — a
+virtualenv inside the project directory is the common case. It rejects anything
+under `sysconfig`'s library prefixes (`_LIB_PREFIXES`) or containing a
+`site-packages` / `dist-packages` marker (`_LIB_MARKERS`) before applying the
+root prefix test. Without it, one request in a real project produced 1241 nodes.
+
 ### Module map (`src/fastapi_visualizer/`)
 
 | Module | Responsibility |
@@ -248,6 +264,20 @@ issues requests to the app; traffic is driven externally (curl, httpx,
   distinction: on the loop only one request runs at a time, on the threadpool
   several worker threads run genuinely in parallel. A branch defaults to the
   loop zone until its request-root `call_enter` classifies it.
+- **A row never changes zone.** Its zone is decided once, by where the request
+  *lives* — a sync endpoint belongs to the threadpool, an async one to the loop —
+  and offloading work mid-request does not move it. An `async def` that calls
+  `run_in_threadpool` stays in the loop zone, parked, while a separate entry for
+  the offloaded frame appears in the threadpool zone. Moving the row instead
+  would claim the request left the loop, which is false: its task is still there,
+  waiting for the worker to finish.
+- **Runtime state resolves in a deliberate order.** One trace can be offloading
+  *and* running on the loop simultaneously — the task factory copies a parent's
+  trace id onto its children, so `gather(run_in_threadpool(a), b())` gives one
+  trace a worker-bound child and a loop-bound sibling. A **fresh** loop-holder
+  claim therefore wins (`RUNNING`); a live offload beats a **stale** one
+  (`WORKER` over `UNTRACED`), because "a worker is definitely busy" outranks "the
+  loop last touched this trace a while ago".
 - **Rows.** Each displayed request is a row; its call tree flows rightward
   from the root node (depth → x, siblings fan vertically within the row).
 - **Runtime state** (per row, shown as a tag next to the `#id`): `RUNNING`
@@ -357,9 +387,11 @@ disables tracing (no leaked callbacks or DISABLE state).
   callbacks fire on whichever OS thread runs the code, and
   `asyncio.current_task()` is `None` on a plain worker thread, so there is no
   per-task stack to key off of there. The thread-local stack fallback is only
-  safe because AnyIO runs one offloaded call per worker thread at a time — it
-  does not unify the stack across the sync/async boundary of a single
-  request.
+  safe because AnyIO runs one offloaded call per worker thread at a time. The
+  sync/async boundary of a single request *is* now bridged, but by the
+  `_current_node` ContextVar rather than by the stack — so it holds only where
+  the context is copied into the worker (anyio, asgiref). A pool that does not
+  copy context gives the offloaded frame no parent.
 - **Multi-worker processes each have their own in-memory collector.**
   `uvicorn --workers N` or gunicorn forks N separate processes; `/_viz` is
   served by whichever worker handles that request, and the ring buffer is
