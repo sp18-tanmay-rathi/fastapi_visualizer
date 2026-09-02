@@ -3,9 +3,10 @@
 Dev tool that visualizes a FastAPI app's async internals as a live flow-graph:
 the event loop drawn as a vertical spine, one row per in-flight request
 showing its nested call tree, await suspend/resume, and threadpool offload —
-in a browser dashboard. `visualize(app)` mounts it at `/_viz`. Header controls:
-load path/count + `fire` (built-in load driver), `speed` (slow-motion
-playback), `max req` (row cap), `step` mode, `clear`.
+in a browser dashboard. `visualize(app)` mounts it at `/_viz` (configurable).
+Drive traffic with your app as normal — there is no built-in load driver.
+Header controls, grouped: `speed` (slow-motion playback) and `step`;
+`rows` (row cap) and `slow over` (slow threshold); `filter`; `clear`.
 
 ## Commands
 
@@ -33,7 +34,10 @@ Always use `uv`, never call `pip`/`python` directly.
 - Feature-detect version-sensitive internals (task-factory shape, limiter
   attributes) rather than assuming a fixed shape.
 - Dashboard is vanilla JS + canvas, no build step, no external CDNs — must
-  work fully offline.
+  work fully offline. It is several files loaded by ordered `<script>` tags
+  (`static/viz/*.js` then `static/dashboard.js`); each attaches to `window.VIZ`
+  and the next reads it, so **the order in `index.html` is load-bearing** and
+  is mirrored in `tests/js/_sources.js`.
 
 ## Conventions
 

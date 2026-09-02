@@ -12,8 +12,8 @@
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
+const { loadAll } = require("./_sources");
 
-const DASHBOARD = path.join(__dirname, "..", "..", "src", "fastapi_visualizer", "static", "dashboard.js");
 
 // Server timestamps come from time.monotonic(), which is a large number
 // (seconds since boot) — not a small one. That matters: the original bug was
@@ -52,6 +52,13 @@ function makeHarness() {
         classList: { add() {}, remove() {}, toggle() { return false; } },
         _handlers: {},
         addEventListener(ev, fn) { this._handlers[ev] = fn; },
+        // The real DOM has these. The dashboard now drives tab state through
+        // aria-selected and focuses the filter box, so the stub needs them.
+        _attrs: {},
+        setAttribute(k, v) { this._attrs[k] = String(v); },
+        getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+        removeAttribute(k) { delete this._attrs[k]; },
+        focus() {}, blur() {}, select() {},
         fire(ev) { if (this._handlers[ev]) this._handlers[ev]({ clientX: 0, clientY: 0 }); },
         getBoundingClientRect: () => ({ left: 0, top: 0 }),
         offsetHeight: 37,
@@ -68,7 +75,15 @@ function makeHarness() {
   let rafCb = null;
   let ws = null;
   const sandbox = {
-    document: { getElementById: el, querySelector: () => el("header") },
+    document: {
+      getElementById: el,
+      querySelector: () => el("header"),
+      // Keyboard shortcuts bind at the document; `activeElement` is what the
+      // handler consults to avoid stealing Space from a focused input.
+      activeElement: null,
+      _keys: {},
+      addEventListener(ev, fn) { this._keys[ev] = fn; },
+    },
     window: { addEventListener() {}, innerWidth: 1200, innerHeight: 837 },
     performance: { now: () => clock },
     requestAnimationFrame: (cb) => { rafCb = cb; },
@@ -80,7 +95,7 @@ function makeHarness() {
   };
   sandbox.self = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(DASHBOARD, "utf8"), sandbox, { filename: DASHBOARD });
+  loadAll(vm, sandbox);
 
   if (!ws) throw new Error("dashboard.js did not open a WebSocket");
   ws.onopen();
