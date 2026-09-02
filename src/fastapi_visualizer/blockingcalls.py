@@ -93,17 +93,50 @@ _MAX_SEEN = 4096
 # reference in `app.state._viz["blocking_calls"]`.
 _HOOK_LOCK = threading.Lock()
 _HOOK_INSTALLED = False
+# Membership. Mutated only under _HOOK_LOCK.
 _ACTIVE: "weakref.WeakSet[BlockingCallDetector]" = weakref.WeakSet()
+# What `_dispatch` actually reads: an immutable tuple of weak references,
+# replaced by whole-object assignment. Building the snapshot inside the hook
+# instead — `tuple(_ACTIVE)` — races with `add()`/`discard()` from another
+# thread and raises `RuntimeError: Set changed size during iteration`
+# (measured: 56 times in 2s under a tight add/discard loop). Weak references
+# rather than the detectors themselves, so a dropped app is still collectable.
+_DISPATCH: "tuple[weakref.ref, ...]" = ()
+
+
+def _refresh_dispatch() -> None:
+    """Rebuild the dispatch snapshot. The caller must hold `_HOOK_LOCK`."""
+    global _DISPATCH
+    _DISPATCH = tuple(weakref.ref(d) for d in _ACTIVE)
 
 
 def _dispatch(event: str, args) -> None:
-    # Snapshot: a detector may install or uninstall while an event is in
-    # flight, and a WeakSet can drop entries mid-iteration.
-    for detector in tuple(_ACTIVE):
-        try:
-            detector._hook(event, args)
-        except Exception:
-            pass
+    """The one process-wide audit hook. Must never raise.
+
+    The outer guard is the important one. This runs as the `sys.addaudithook`
+    callback, so anything escaping it is raised *inside whatever audited call
+    happened to trigger it* — a plain `open()` in application code, on
+    whatever thread that call was on — not politely logged. Verified: a hook
+    that raises makes an unrelated `open()` fail with the hook's own
+    exception. Hence the project rule that every instrumentation path is
+    fail-soft.
+
+    No lock here on purpose: this is the hottest path in the process (the
+    interpreter raises audit events for every library in it, and the hook
+    already costs ~20% of throughput), so it takes one atomic read of an
+    immutable tuple instead.
+    """
+    try:
+        for ref in _DISPATCH:
+            detector = ref()
+            if detector is None:
+                continue  # its app was dropped; the next refresh drops the ref
+            try:
+                detector._hook(event, args)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _ensure_hook() -> bool:
@@ -141,14 +174,18 @@ class BlockingCallDetector:
             self.enabled = False
             return
         self.enabled = True
-        _ACTIVE.add(self)
+        with _HOOK_LOCK:
+            _ACTIVE.add(self)
+            _refresh_dispatch()
 
     def uninstall(self) -> None:
         # The process-wide hook stays registered (CPython has no way to remove
         # one), but this detector stops being dispatched to at all.
         self.enabled = False
         self._seen.clear()
-        _ACTIVE.discard(self)
+        with _HOOK_LOCK:
+            _ACTIVE.discard(self)
+            _refresh_dispatch()
 
     # -- the hook ---------------------------------------------------------
 

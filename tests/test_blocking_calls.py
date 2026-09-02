@@ -214,3 +214,97 @@ def test_the_dedup_set_is_bounded():
         identity.trace_id_var.reset(token)
 
     assert len(d._seen) <= _MAX_SEEN
+
+
+# --- the dispatcher must never raise ---------------------------------------
+#
+# `_dispatch` is the single process-wide `sys.addaudithook` callback. An
+# exception escaping it is raised inside whatever audited call happened to
+# trigger it — a plain `open()` somewhere in application code, on whatever
+# thread ran it — so this is the one function in the package where an unhandled
+# error is worst. It used to build its snapshot with `tuple(_ACTIVE)`, which
+# races with install/uninstall on another thread.
+
+
+def test_dispatch_survives_concurrent_install_and_uninstall():
+    """The reviewer's repro, as a test.
+
+    A tight install/uninstall loop on one thread while the audit hook fires on
+    another. Iterating the WeakSet live raised
+    `RuntimeError: Set changed size during iteration` — measured 56 times in
+    two seconds.
+    """
+    import threading
+
+    import fastapi_visualizer.blockingcalls as bc
+
+    stop = threading.Event()
+    escaped: list[BaseException] = []
+    loop_tid = threading.get_ident()
+
+    churn = bc.BlockingCallDetector()
+    resident = bc.BlockingCallDetector()
+    resident.install(loop_tid)
+
+    def mutate():
+        while not stop.is_set():
+            churn.install(loop_tid)
+            churn.uninstall()
+
+    def fire():
+        while not stop.is_set():
+            try:
+                bc._dispatch("open", ("/tmp/x", "r", 0))
+            except BaseException as exc:  # noqa: BLE001 - the whole point
+                escaped.append(exc)
+
+    threads = [threading.Thread(target=mutate, daemon=True),
+               threading.Thread(target=fire, daemon=True)]
+    for t in threads:
+        t.start()
+    stop.wait(2.0)
+    stop.set()
+    for t in threads:
+        t.join(timeout=2)
+
+    resident.uninstall()
+    churn.uninstall()
+    assert not escaped, f"{len(escaped)} exception(s) escaped the audit hook: {escaped[:3]}"
+
+
+def test_dispatch_swallows_a_detector_that_raises():
+    """One broken detector must not take the audited call down with it."""
+    import fastapi_visualizer.blockingcalls as bc
+
+    class Exploding:
+        def _hook(self, event, args):
+            raise RuntimeError("boom")
+
+    boom = Exploding()
+    with bc._HOOK_LOCK:
+        bc._ACTIVE.add(boom)
+        bc._refresh_dispatch()
+    try:
+        bc._dispatch("open", ("/tmp/x", "r", 0))  # must not raise
+    finally:
+        with bc._HOOK_LOCK:
+            bc._ACTIVE.discard(boom)
+            bc._refresh_dispatch()
+
+
+def test_the_snapshot_does_not_pin_a_dropped_detector():
+    """Weak references in the snapshot, so a dropped app is still collectable."""
+    import gc
+    import threading
+    import weakref as _wr
+
+    import fastapi_visualizer.blockingcalls as bc
+
+    d = bc.BlockingCallDetector()
+    d.install(threading.get_ident())
+    ref = _wr.ref(d)
+    del d
+    gc.collect()
+    assert ref() is None, "the dispatch snapshot kept a dead detector alive"
+    # and dispatching over a snapshot holding a dead ref is still safe
+    bc._dispatch("open", ("/tmp/x", "r", 0))

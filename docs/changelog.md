@@ -170,6 +170,28 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The audit-hook dispatcher can no longer raise into application code.**
+  `_dispatch` built its snapshot with `tuple(_ACTIVE)`, which races with the
+  `add()`/`discard()` calls in `install()`/`uninstall()` on another thread and
+  raises `RuntimeError: Set changed size during iteration` — measured 56 times
+  in two seconds under a tight add/discard loop. That `tuple()` sat *outside*
+  the `try`, and because this is the process-wide `sys.addaudithook` callback,
+  the exception surfaces **inside whatever audited call triggered it**: a plain
+  `open()` in application code, on whatever thread ran it. Confirmed directly —
+  a hook that raises makes an unrelated `open()` fail with the hook's own
+  exception. Realistic in exactly the multi-app case the `WeakSet` exists for:
+  one app's shutdown racing another's live detection.
+
+  `_dispatch` now reads a single immutable tuple, replaced by whole-object
+  assignment under `_HOOK_LOCK` in `install()`/`uninstall()` — the same pattern
+  as `Monitor.active_frame()`. No lock in the hook itself, deliberately: it is
+  the hottest path in the process (the interpreter raises audit events for
+  every library in it, and the hook already costs ~20% of throughput). The
+  tuple holds **weak** references, so a dropped app's detector stays
+  collectable; a tuple of detectors would have quietly defeated the `WeakSet`.
+  An outer `try/except` wraps the whole body regardless, per the project's
+  fail-soft rule.
+
 - **A freeze in untraced code no longer blames an innocent request.**
   `Monitor._loop_close` cleared only `_active_node`/`_active_since`, so
   `_active_trace` kept pointing at the last request that ran in-root code for
