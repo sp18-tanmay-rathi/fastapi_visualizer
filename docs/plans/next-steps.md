@@ -300,6 +300,21 @@ Files: `events.py`, `monitor.py` (or a timing helper), `app.py` (threshold),
 **Done-check:** hitting `/blocking` turns that node + the spine red; a normal
 `await asyncio.sleep` request does NOT.
 
+> **Follow-up — `docs/plans/blocking-detection-v2.md`.** The wall-clock
+> threshold cannot see fast-but-wrong blocking calls (a 3 ms DB query is the
+> same defect as `time.sleep`), reports **nothing at all** for a frame that
+> blocks forever (detection only runs at the *next* boundary, and there isn't
+> one), and cannot tell waiting apart from computing. That file has the analysis
+> and a second pass: watchdog thread, known-blocking-call detection, optional
+> syscall tracing. Not required for v0.1.0.
+>
+> **Status: the first three steps of that plan are done.** `watchdog.py` catches
+> a loop that is stuck right now (including a request that never returns),
+> `blockingcalls.py` catches forbidden waits at any speed via `sys.addaudithook`,
+> ruff's `ASYNC` rules cover paths a run never reaches, and the dashboard shows
+> three separate verdicts instead of one. Only the optional Linux syscall pass is
+> unstarted.
+
 ---
 
 # Phase 3 — Safety

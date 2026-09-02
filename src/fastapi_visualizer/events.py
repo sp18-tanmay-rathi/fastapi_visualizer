@@ -15,6 +15,18 @@ OFFLOAD_END = "offload_end"
 POOL_SAMPLE = "pool_sample"
 LOOP_BLOCKED = "loop_blocked"
 LOOP_UNBLOCKED = "loop_unblocked"
+# Distinct from LOOP_BLOCKED on purpose. loop_blocked is retrospective —
+# "that frame held the loop too long", known only once it ended.
+# loop_stalled is live — "the loop is not responding right now" — raised by
+# watchdog.py from another thread, and it is the only one that can report a
+# frame that never returns.
+LOOP_STALLED = "loop_stalled"
+LOOP_UNSTALLED = "loop_unstalled"
+# The third detector, and the only categorical one. loop_blocked and
+# loop_stalled both answer "was the loop held too long?"; this answers "did
+# the loop thread do something it is never allowed to do?" -- which is what
+# catches a 3ms database call that no threshold would ever flag.
+BLOCKING_CALL = "blocking_call"
 
 
 @dataclass

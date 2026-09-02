@@ -142,7 +142,9 @@ your app.
 visualize(
     app,
     roots=None,                  # dirs to trace; default = caller's directory
-    slow_ms=100,                 # loop-blocking threshold (see below)
+    slow_ms=100,                 # "held the loop too long" threshold
+    stall_ms=250,                # "loop is stuck right now" threshold; 0 disables
+    detect_blocking_calls=True,  # report forbidden waits at any speed
     enabled=None,                # None = auto (FASTAPI_VIZ=1 or app.debug)
     path="/_viz",                # where to mount the dashboard
     correlate_request_id=False,  # use an inbound X-Request-ID as the trace id
@@ -176,18 +178,73 @@ characters.
 
 ## Blocking detection
 
-Sync or CPU work inside an `async def` — `time.sleep`, a tight loop, a blocking
-driver call — freezes the single loop thread, so *every* other request stalls.
-The dashboard flashes the EVENT LOOP spine red with
-`🔥 BLOCKED by <qualname> (Ns)`, glows the offending node, and leaves a durable
-`🔥 blocked` tag on that request's row so a finished request still records that
-it froze the loop.
+Code that **waits** on the loop thread — `time.sleep`, a file read, a blocking
+driver call — freezes the single thread, so every other request stalls behind
+it. Code that **computes** for a long time holds it too, but that may be
+deliberate. The tool distinguishes them.
 
-The threshold is `slow_ms` (default 100): an in-root frame that holds the loop
-longer than this **without yielding** is reported. An `await` that takes a long
-time is *not* blocking — yielding is exactly what it's supposed to do. Work on
-a threadpool worker is never flagged either; that's what the threadpool is for.
-Try it with the demo's `/blocking` endpoint.
+Three detectors answer three different questions. Each catches something the
+others cannot, so all three run:
+
+| detector | question | catches |
+|---|---|---|
+| **timer** | did a frame hold the loop longer than `slow_ms`? | long holds — and it is the only one that sees a library which never releases the GIL |
+| **watchdog** | is the loop unresponsive *right now*? | freezes as they happen, with the stack, plus a request that **never returns** |
+| **listener** | did the loop touch a file, socket, DNS, database or process? | forbidden waits at **any** speed, including a 1ms call |
+
+### What you see
+
+| on the row | meaning |
+|---|---|
+| `⏱ STALLED` | the loop is frozen inside this request *right now* |
+| `🔥 blocking I/O: file` | it waited on the outside world — a bug at any speed |
+| `⚙ held the loop 1.01s ×2` | it ran long, cause unknown — click the row for the frames |
+
+`⚙` is deliberately **not** labelled "CPU-bound". No detected wait is not proof
+of computation: `time.sleep` raises no audit event and leaves no Python frame,
+so claiming a cause there would mislabel the most common blocking call of all.
+The inspector says plainly that the cause is unknown.
+
+### Thresholds
+
+`slow_ms` (default 100) is the timer's: a frame holding the loop longer than
+this **without yielding** is reported once it ends. `stall_ms` (default 250) is
+the watchdog's, and answers a different question — "is it stuck?" rather than
+"was that slow?" — so it wants a larger number. Set `stall_ms=0` to turn the
+watchdog off. Keep it well above its 50ms heartbeat or a healthy loop will trip
+it.
+
+An `await` never trips any of them, however long it takes: yielding is exactly
+what it is supposed to do, and the loop stays free. Work on a threadpool worker
+is never flagged either — that is what the threadpool is for.
+
+### Two limits worth knowing
+
+**The watchdog cannot reach your browser during a freeze.** The WebSocket send
+runs on the very loop that is stuck. It writes the stall and its stack to the
+**log** immediately instead, which is where you would be looking when a server
+hangs; the dashboard catches up once the loop recovers.
+
+**The listener cannot see pooled database queries.** Python announces that a
+connection was *opened*, not that a query was *sent*. Real apps open once and
+reuse, so the queries that follow raise no event. It still catches files,
+subprocesses, DNS and the first connect. `detect_blocking_calls=False` turns it
+off; it costs roughly 20% of throughput because Python announces these events
+for every library in the process.
+
+### Try it
+
+`examples/demo.py` has one endpoint per case, and no two that show the same
+thing:
+
+| endpoint | shows |
+|---|---|
+| `/async` | a clean async request — awaits, never holds the loop |
+| `/sync` | a `def` endpoint, run on a threadpool worker |
+| `/offloaded` | the **correct** way to call blocking code from async: the request parks, a worker runs the call |
+| `/blocking` | sync work inside `async def` → `⚙ held the loop` |
+| `/cpu` | pure computation, waiting on nothing — an **identical** row, because the timer knows a frame ran long, not why |
+| `/fast_db` | a ~1ms DB connect on the loop → `🔥 blocking I/O: database`, which no threshold could ever catch |
 
 ## How it works
 

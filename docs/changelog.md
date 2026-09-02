@@ -8,6 +8,41 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Blocking detection v2 — two more detectors alongside the timer.** The
+  original threshold timer answers only "did a frame run long?", which is both
+  retrospective (a server hung *right now* shows nothing) and duration-based (a
+  5ms `open()` on the loop is a real bug no threshold catches). Two detectors
+  close those gaps:
+  - `watchdog.py` — a 50ms heartbeat on the loop plus an **off-loop daemon
+    thread** that watches it. When the heartbeat misses `stall_ms` (default 250,
+    `stall_ms=0` disables), the loop is captured with `sys._current_frames()` and
+    a `loop_stalled` event is emitted, blaming the deepest in-root frame in the
+    stack. This is the only detector that catches a request which **never
+    returns**. It also writes the stall and its stack to the log immediately from
+    its own thread, because the WebSocket send runs on the loop that is stuck.
+  - `blockingcalls.py` — a `sys.addaudithook` listener that reports a
+    `blocking_call` whenever the loop thread opens a file, connects a socket,
+    resolves DNS, connects to a database, or spawns a process during a traced
+    request. **No threshold**: a 1ms blocking read is reported. Own-package
+    calls, imports, worker threads and untraced calls are filtered out, and the
+    dedup set is bounded at 4096 entries. On by default;
+    `detect_blocking_calls=False` turns it off (it costs ~20% throughput).
+  - ruff's `ASYNC` ruleset is enabled as the static complement, catching blocking
+    calls in `async def` on code paths a run never reaches.
+- **Three honest verdicts on the row**: `⏱ STALLED` (frozen right now),
+  `🔥 blocking I/O: <category>` (a forbidden wait at any speed), and
+  `⚙ held the loop 1.01s ×2` (ran long, cause unknown). The last is deliberately
+  *not* labelled "CPU-bound" — no audit event fired is not evidence of
+  computation, and `time.sleep` raises none. Per-span detail lives in the
+  inspector card so the row stays terse.
+- **Demo endpoints for every case** in `examples/demo.py`: `/offloaded` (the
+  correct way to call blocking code from async), `/fast_db` (listener-only — a
+  1-2ms connect no timer could catch) and `/cpu` (pure computation, which draws
+  the *same* row as `/blocking` — the demonstration that "held the loop" names a
+  symptom, not a cause), alongside the existing `/async`, `/sync` and
+  `/blocking`. One endpoint per distinct verdict, none duplicated; each docstring
+  names the detector that should fire.
+
 - **Multi-worker awareness** (Phase 3, plan task 9): when `WEB_CONCURRENCY`
   or `UVICORN_WORKERS` is > 1, the visualizer logs a startup warning and the
   dashboard shows a persistent header banner — "⚠ worker PID of multiple —
@@ -135,6 +170,57 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The audit-hook dispatcher can no longer raise into application code.**
+  `_dispatch` built its snapshot with `tuple(_ACTIVE)`, which races with the
+  `add()`/`discard()` calls in `install()`/`uninstall()` on another thread and
+  raises `RuntimeError: Set changed size during iteration` — measured 56 times
+  in two seconds under a tight add/discard loop. That `tuple()` sat *outside*
+  the `try`, and because this is the process-wide `sys.addaudithook` callback,
+  the exception surfaces **inside whatever audited call triggered it**: a plain
+  `open()` in application code, on whatever thread ran it. Confirmed directly —
+  a hook that raises makes an unrelated `open()` fail with the hook's own
+  exception. Realistic in exactly the multi-app case the `WeakSet` exists for:
+  one app's shutdown racing another's live detection.
+
+  `_dispatch` now reads a single immutable tuple, replaced by whole-object
+  assignment under `_HOOK_LOCK` in `install()`/`uninstall()` — the same pattern
+  as `Monitor.active_frame()`. No lock in the hook itself, deliberately: it is
+  the hottest path in the process (the interpreter raises audit events for
+  every library in it, and the hook already costs ~20% of throughput). The
+  tuple holds **weak** references, so a dropped app's detector stays
+  collectable; a tuple of detectors would have quietly defeated the `WeakSet`.
+  An outer `try/except` wraps the whole body regardless, per the project's
+  fail-soft rule.
+
+- **A freeze in untraced code no longer blames an innocent request.**
+  `Monitor._loop_close` cleared only `_active_node`/`_active_since`, so
+  `_active_trace` kept pointing at the last request that ran in-root code for
+  the rest of the process. A stall in library or framework code inherited that
+  trace — usually a request that had already finished — and the dashboard
+  branded that row. Every field is now cleared together, and an unowned stall
+  reports `trace_id: None` while still carrying the stack that identifies it.
+- **Cross-thread reads of the monitor's frame state are now a single atomic
+  snapshot.** `monitor.py` documents the `_active_*` fields as loop-thread-only
+  and lock-free; the watchdog read two of them from its own thread, which could
+  pair one frame's node with another's trace. `Monitor.active_frame()` returns
+  one tuple, replaced by whole-object assignment.
+- **The live "this frame is frozen right now" ring never once appeared.** The
+  `loop_stalled` handler built its state object without copying `node_id`
+  across, so `drawNode`'s `node.id === loopStalled.node_id` compared against
+  `undefined` on every frame. The backend had been sending the id all along.
+- **A live offload no longer masks a request executing on the loop** — see the
+  entry under Changed.
+- **`sys.addaudithook` is installed once per process instead of once per app.**
+  Audit hooks cannot be removed, so every app startup leaked another permanent
+  callback firing on every audited event. One dispatcher now fans out to a
+  weak registry of live detectors.
+- **Blocking recorded before a row is admitted keeps the same shape as after.**
+  The pre-admission stash kept only the largest span and never populated
+  `blockCount`/`blockSpans`, so a row admitted late could claim it held the
+  loop while its inspector card listed no spans at all.
+- **The two duplicated `offload_start` / `offload_end` handler pairs are merged**
+  — they worked, but an edit to one would have missed the other.
+
 - **Requests now appear automatically; auto-playback was completely stalled.**
   `render()` runs from page load, so `advancePlayback()` reached its idle branch
   long before any event existed — where `maxSeenT` is still `0` and `virtualT`
@@ -204,6 +290,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Offloaded work is drawn truthfully: the request parks, a worker runs the
+  call.** An `async def` that calls `run_in_threadpool` no longer migrates its
+  whole row to the THREADPOOL zone — its task is still on the loop, waiting. The
+  row stays in the EVENT LOOP zone, parked, and a separate entry for the
+  offloaded frame appears in the threadpool zone. A row's zone is now decided
+  once, by where the request lives, and never changes.
+- **Offloaded frames get their real parent.** `monitor.py` carries a
+  `_current_node` ContextVar; anyio copies the calling context into the worker
+  thread, so an offloaded frame no longer reports `parent_id: None` and is no
+  longer stranded in the graph.
+- **Library code under a root is excluded from tracing.** A virtualenv inside
+  the project directory used to be traced as application code — 1241 nodes for
+  one request in a real project. `_in_root()` now rejects `sysconfig` library
+  prefixes and any path containing `site-packages` / `dist-packages`.
+- **A live offload no longer hides a request that is running on the loop.** The
+  task factory copies a trace id onto child tasks, so one trace can have a
+  worker-bound child and a loop-bound sibling at once;
+  `gather(run_in_threadpool(a), b())` used to read "WAITING · worker" while the
+  loop was demonstrably busy with that same request. A fresh loop-holder claim
+  now wins, and a live offload beats only a stale one.
+- **Blocking spans accumulate instead of overwriting.** A request that blocks
+  twice reports the sum and both frames; a watchdog span and a timer span
+  covering the same freeze are reconciled into one entry rather than
+  double-counted.
 - **Overlay panels share one right-side column.** The legend and the request
   inspector now live in a flex column pinned to the right edge — legend at the
   top, inspector at the bottom (it moved from bottom-left). Each shrinks into

@@ -53,6 +53,7 @@
   var ROW_EXPANDED_MIN = 180; // expanded row: never smaller than this
   var ROW_EXPANDED_MAX_FRAC = 0.6; // ...nor taller than this fraction of the viewport
   var ROW_GAP = 8; // breathing room between stacked rows
+  var WORK_ROW_H = 52; // a live offloaded-call entry in the THREADPOOL zone
 
   // Two-zone layout (task 5): the canvas splits into a top EVENT LOOP zone
   // (async requests, one-runs-at-a-time) and a bottom THREADPOOL zone (sync
@@ -186,14 +187,6 @@
   // single-threaded asyncio event loop this is visualizing.
   var loopHolder = null;
 
-  // Blocking span freezing the EVENT LOOP (task 3), or null. Set on a
-  // loop_blocked event with a real-time expiry (`until`); cleared in render()
-  // when that expires (NOT by loop_unblocked — see the ingest note). While set,
-  // the loop spine flashes red ("🔥 BLOCKED by <qualname> (Ns)") and the
-  // offending node draws a hot red glow — surfacing the classic async failure:
-  // sync/CPU work inside a coroutine stalling every other request.
-  // { traceId, node_id, qualname, duration_ms, until }
-  var loopBlocked = null;
 
   // Request selected for the inspector panel (trace_id), or null. Rendered as
   // a DOM overlay rather than on the canvas so the trace id is selectable text.
@@ -208,6 +201,21 @@
   // top of render() from the PREVIOUS frame's hoverRects (one frame of lag,
   // imperceptible) so drawNode needs no second layout pass.
   var hoverQual = null;
+
+  // Offloaded calls executing on a worker thread RIGHT NOW, keyed
+  // "traceId:nodeId". A request that awaits run_in_threadpool / sync_to_async
+  // does not itself move to a worker: its coroutine stays suspended on the
+  // loop while a *separate function* runs on the worker. So the work is
+  // tracked here and rendered in the THREADPOOL zone as its own entry, while
+  // the request keeps its row in the EVENT LOOP zone.
+  var activeOffloads = new Map();
+
+  // The loop is NOT RESPONDING right now, as reported by the watchdog thread
+  // (see watchdog.py), or null. Unlike loop_blocked — which is retrospective and
+  // arrives only once the span is over, so it needs a timed flash — this is a
+  // live state with a real start and end, so it is simply held until
+  // loop_unstalled arrives. { qualname, deepest, stack, sinceT, traceId }
+  var loopStalled = null;
 
   // Latest threadpool sample.
   var pool = { borrowed: 0, total: POOL_DEFAULT_TOTAL, queued: 0 };
@@ -338,7 +346,13 @@
       // so hand-offs never happen for pure sync traffic — without the
       // request_end checkpoint a step would drain the whole buffer at once and
       // then look frozen. With it, each click visibly completes one request.
+      // Offload boundaries are checkpoints too. With one request in flight
+      // there is no loop hand-off after the first click, so a step drained
+      // straight through request_end and applied offload_start and
+      // offload_end in ONE batch — the worker entry appeared and vanished
+      // within a single ingest, i.e. invisibly.
       if (loopHolder !== before && loopHolder !== null) break;
+      if (ev.kind === "offload_start" || ev.kind === "offload_end") break;
       if (ev.kind === "request_end") break;
     }
     pending = pending.slice(applied);
@@ -386,7 +400,17 @@
       // "loop" (async, runs on the event loop) until the request-root frame's
       // call_enter proves it's "pool" (sync, offloaded to a worker thread).
       // Determines which zone the row lives in (task 5).
+      // Which zone the row lives in — fixed by where the request's HANDLER
+      // runs, and never changed afterwards. See updateZone().
       zone: "loop",
+      sawLoopFrame: false,
+      sawPoolFrame: false,
+      // Offloads: how many are running right now (drives the WORKER state),
+      // and a durable record for the finished row.
+      liveOffloads: 0,
+      offloadCount: 0,
+      offloadMs: 0,
+      _offloadStartT: new Map(),
       // Server-time of the most recent in-root event for this trace; used to
       // decide when a loop holder has gone "untraced" (task 4).
       lastEventT: 0,
@@ -395,6 +419,21 @@
       // just flashed for the moment. blockedMs = longest such span, for the tag.
       blocked: false,
       blockedMs: 0,
+      // WHICH frame held the loop. The node itself drops off the collapsed
+      // call-path as soon as it returns, so without remembering the name the
+      // finished row can only say how long, never where.
+      // Every span this request spent holding the loop. Keeping only the
+      // worst one under-reported a handler with two blocking calls by half,
+      // and naming only the last one hid the first entirely.
+      blockSpans: [],
+
+      stalled: false, // the loop is frozen inside THIS request right now
+      // Categories of forbidden wait this request made on the loop thread
+      // (file, socket, dns, database, subprocess, http). Recorded regardless
+      // of how fast the call was — that is the whole point of detecting it by
+      // identity rather than by duration.
+      ioCalls: new Set(),
+      ioDetails: [],
       // --- Request outcome + inspector data (task 14) ---
       shortId: traceId.slice(0, SHORT_ID_LEN),
       startT: 0, // server-time of request_start (duration fallback)
@@ -413,14 +452,38 @@
       children: [],
       isRoot: true,
     };
-    // Carry over a blocked tag recorded before this trace could be admitted.
-    if (blockedBefore.has(traceId)) {
+    // Carry over blocking recorded before this trace could be admitted.
+    var pre = blockedBefore.get(traceId);
+    if (pre) {
       b.blocked = true;
-      b.blockedMs = blockedBefore.get(traceId);
+      b.blockedMs = pre.ms;
+      b.blockCount = pre.count;
+      b.blockSpans = pre.spans;
       blockedBefore.delete(traceId);
     }
     branches.set(traceId, b);
     return b;
+  }
+
+  // A request's zone is decided by where its HANDLER runs, and never changes.
+  //
+  //   any traced frame ran on the event loop  -> EVENT LOOP, for its whole life
+  //   none ever did                           -> THREADPOOL (a sync handler)
+  //
+  // Measured basis: `await run_in_threadpool(f)` leaves the request's coroutine
+  // SUSPENDED on the loop — its own frames only ever execute on the loop
+  // thread, and the loop stays as free as it is during `await asyncio.sleep()`
+  // (55 other callbacks served in 300ms, either way). Only `f` runs on a
+  // worker. So the request has not moved, and its row must not move; the
+  // worker's activity is shown separately (see activeOffloads).
+  //
+  // The predecessor keyed off `parent_id == null`, assuming only a request root
+  // is parentless. False: a worker thread starts with an empty stack, so the
+  // first frame offloaded onto it also reported parent_id null and looked like
+  // a root — which is how an async request that offloaded a DB call got
+  // stranded in THREADPOOL for the rest of its life.
+  function updateZone(b) {
+    b.zone = !b.sawLoopFrame && b.sawPoolFrame ? "pool" : "loop";
   }
 
   // --- Event ingestion ---------------------------------------------------
@@ -469,6 +532,14 @@
           if (extra.duration_ms != null) b1.durationMs = extra.duration_ms;
           else if (b1.startT) b1.durationMs = Math.round((ev.t - b1.startT) * 1000);
           if (extra.error) b1.error = extra.error;
+          // A dropped offload_end would otherwise leave this request looking
+          // forever busy on a worker. A finished request is on no worker.
+          b1.stalled = false;
+          b1.liveOffloads = 0;
+          b1._offloadStartT.clear();
+          activeOffloads.forEach(function (w, k) {
+            if (w.traceId === traceId) activeOffloads.delete(k);
+          });
           // Grey out the request-root node too, so a finished branch reads
           // as done at a glance (persists on screen — see note above).
           b1.rootNode.state = "done";
@@ -486,9 +557,9 @@
         // Classify the row's zone from its request-root frame (parent_id null):
         // the backend stamps execution = "threadpool" when the frame runs on a
         // worker thread (sync def), "event_loop" otherwise (async).
-        if (extra.parent_id == null && extra.execution) {
-          b2.zone = extra.execution === "threadpool" ? "pool" : "loop";
-        }
+        if (extra.execution === "event_loop") b2.sawLoopFrame = true;
+        else if (extra.execution === "threadpool") b2.sawPoolFrame = true;
+        updateZone(b2);
         var parent =
           extra.parent_id == null
             ? b2.rootNode
@@ -500,6 +571,7 @@
           file: extra.file,
           line: extra.line,
           is_async: !!extra.is_async,
+          execution: extra.execution || "event_loop",
           state: "running",
           offloaded: false,
           children: [],
@@ -507,11 +579,13 @@
         b2.nodesById.set(extra.node_id, node);
         parent.children.push(node);
         b2.stack.push(extra.node_id);
-        // Entering a frame means this trace is actively running — but only a
-        // LOOP-zone request can hold the single event loop. Pool-zone (sync,
-        // worker-thread) work runs in parallel and must never claim/steal the
-        // loop holder (task 4/5 correctness).
-        if (b2.zone === "loop") loopHolder = traceId;
+        // Entering a frame means this trace is running — but the loop holder
+        // must be judged per FRAME, not per request. A loop-zone request can
+        // contain threadpool frames (it awaited run_in_threadpool), and while
+        // that runs the request is PARKED: its coroutine is suspended and the
+        // loop is free for someone else. Keying off the branch's zone here
+        // would let a parked request claim the loop it is not on.
+        if (extra.execution === "event_loop") loopHolder = traceId;
         continue;
       }
 
@@ -556,7 +630,80 @@
           n5.state = "running";
           if (n5.awaiting) n5.awaitDone = true; // the await it was blocked on resolved
         }
-        if (b5.zone === "loop") loopHolder = traceId;
+        // Same per-frame rule as call_enter. `resume` carries no execution
+        // tag, so consult the node recorded at call_enter; default to treating
+        // it as loop work when the node is unknown (an event was shed).
+        if (!n5 || n5.execution === "event_loop") loopHolder = traceId;
+        continue;
+      }
+
+      if (ev.kind === "blocking_call") {
+        var bcb = branches.get(traceId);
+        if (bcb) {
+          bcb.ioCalls.add(extra.category || "io");
+          if (bcb.ioDetails.length < 12) {
+            bcb.ioDetails.push({
+              category: extra.category || "io",
+              detail: extra.detail || "",
+              qualname: extra.qualname || null,
+            });
+          }
+        }
+        continue;
+      }
+
+      if (ev.kind === "loop_stalled") {
+        var stk = extra.stack || [];
+        var sb2 = branches.get(traceId);
+        // A stall reported against an already-finished request is not this
+        // request's stall: the backend can only attribute to whatever frame
+        // last ran, and a freeze in untraced code carries no live owner. Brand
+        // nothing rather than brand the wrong row.
+        if (sb2 && sb2.done) sb2 = null;
+        if (sb2) {
+          // A stall is a hold in progress; record it as a span too, so the
+          // card lists it even if loop_blocked never lands (a hang has no end).
+          if (extra.qualname && !sb2.blockSpans.some(function (sp) {
+                return sp.nodeId === extra.node_id;
+              })) {
+            sb2.blockSpans.push({
+              qualname: extra.qualname,
+              ms: null, // still running; duration unknown
+              nodeId: extra.node_id,
+            });
+            sb2.blockCount++;
+            sb2.blocked = true;
+          }
+          if (extra.node_id != null) {
+            var sn = sb2.nodesById.get(extra.node_id);
+            if (sn) sn.wasBlocking = true;
+          }
+          // Mark the ROW, so the stall is visible on the request it belongs
+          // to. A banner at the top of the zone is detached from its row —
+          // and that row may be scrolled out of sight entirely.
+          sb2.stalled = true;
+        }
+        loopStalled = {
+          qualname: extra.qualname || "?",
+          // Carried so drawNode can put the hot ring on the frame that is
+          // frozen RIGHT NOW. Omitting it made that comparison test against
+          // `undefined` on every frame, so the live indicator this event
+          // exists to drive never once fired.
+          node_id: extra.node_id != null ? extra.node_id : null,
+          deepest: stk.length ? stk[stk.length - 1].qualname : null,
+          stack: stk,
+          sinceT: ev.t,
+          traceId: traceId,
+        };
+        continue;
+      }
+
+      if (ev.kind === "loop_unstalled") {
+        if (loopStalled) {
+          var ub = branches.get(loopStalled.traceId);
+          if (ub) ub.stalled = false;
+        }
+        loopStalled = null;
         continue;
       }
 
@@ -564,51 +711,112 @@
         var bb = branches.get(traceId);
         var nb = bb && bb.nodesById.get(extra.node_id);
         var dur = extra.duration_ms || 0;
+        // How long the node keeps its hot ring, in REAL time — a long block
+        // would otherwise flash past unseen at slow playback speeds.
         var until =
           performance.now() +
           Math.max(BLOCK_FLASH_MIN_MS, Math.min(BLOCK_FLASH_MAX_MS, dur));
         if (bb) {
           bb.blocked = true; // persistent row tag (survives to DONE)
-          bb.blockCount++;
-          if (dur > bb.blockedMs) bb.blockedMs = dur;
+          bb.blockedMs += dur; // TOTAL time the loop was held by this request
+          // The watchdog may already have opened a span for this same frame
+          // while it was still stuck. Close that one out rather than adding a
+          // second — otherwise one blocking call is listed twice, once as
+          // "still running" and once with its duration.
+          var open = null;
+          for (var oi = 0; oi < bb.blockSpans.length; oi++) {
+            if (bb.blockSpans[oi].ms == null && bb.blockSpans[oi].nodeId === extra.node_id) {
+              open = bb.blockSpans[oi];
+              break;
+            }
+          }
+          if (open) {
+            open.ms = dur;
+            open.qualname = extra.qualname || open.qualname;
+          } else {
+            bb.blockCount++;
+            bb.blockSpans.push({
+              qualname: extra.qualname || "?",
+              ms: dur,
+              nodeId: extra.node_id,
+            });
+          }
         } else {
           // Trace blocked while still over the row cap (not admitted yet).
-          // Stash it so the tag survives to when it IS admitted.
-          blockedBefore.set(traceId, Math.max(dur, blockedBefore.get(traceId) || 0));
+          // Stash it so the tag survives to when it IS admitted — with the
+          // same shape the admitted path uses. Keeping only a max here made a
+          // late-admitted row report one span and its card report none, so the
+          // row and the card disagreed about the same request.
+          var pre = blockedBefore.get(traceId);
+          if (!pre) {
+            pre = { ms: 0, count: 0, spans: [] };
+            blockedBefore.set(traceId, pre);
+          }
+          pre.ms += dur;
+          pre.count++;
+          if (pre.spans.length < 32) {
+            pre.spans.push({
+              qualname: extra.qualname || "?",
+              ms: dur,
+              nodeId: extra.node_id,
+            });
+          }
         }
         if (nb) {
-          nb.blocking = true;
+          nb.blocking = true;      // hot ring, expires on a real-time timer
+          nb.wasBlocking = true;   // permanent: this is the frame that did it
           nb.blockUntil = until;
         }
-        loopBlocked = {
-          traceId: traceId,
-          node_id: extra.node_id,
-          qualname: (nb && nb.qualname) || extra.qualname || "?",
-          duration_ms: dur,
-          until: until,
-        };
+
         continue;
       }
 
       if (ev.kind === "loop_unblocked") {
-        // Visual flash is time-driven (see BLOCK_FLASH_*), so we DON'T clear it
-        // here — loop_unblocked arrives in the same drain as loop_blocked, and
-        // clearing now would make the red invisible. The real-time expiry set
-        // above (checked in render()/drawNode) ends the flash instead.
+        // Deliberately does nothing. The node's hot ring is time-driven
+        // (BLOCK_FLASH_*, expired in drawNode): loop_unblocked arrives in the
+        // same drain as loop_blocked, so clearing the ring here would make it
+        // invisible. The span itself was already closed out on loop_blocked.
         continue;
       }
 
       if (ev.kind === "offload_start") {
-        var b6 = branches.get(traceId);
-        var n6 = b6 && b6.nodesById.get(extra.node_id);
-        if (n6) n6.offloaded = true;
+        var bo = branches.get(traceId);
+        if (bo) {
+          bo.liveOffloads++;
+          bo.offloadCount++;
+          bo._offloadStartT.set(extra.node_id, ev.t);
+          var no = bo.nodesById.get(extra.node_id);
+          if (no) no.offloaded = true;
+          // Only surface work belonging to a LOOP-zone request. For a sync
+          // handler the offloaded frame IS the request, already shown as its
+          // own row in the pool zone — a second entry would just duplicate it.
+          if (bo.zone === "loop") {
+            activeOffloads.set(traceId + ":" + extra.node_id, {
+              traceId: traceId,
+              nodeId: extra.node_id,
+              qualname: (no && no.qualname) || ev.name || "?",
+              hue: bo.hue,
+              shortId: bo.shortId,
+              startT: ev.t,
+            });
+          }
+        }
         continue;
       }
 
       if (ev.kind === "offload_end") {
-        var b7 = branches.get(traceId);
-        var n7 = b7 && b7.nodesById.get(extra.node_id);
-        if (n7) n7.offloaded = false;
+        var be = branches.get(traceId);
+        if (be) {
+          be.liveOffloads = Math.max(0, be.liveOffloads - 1);
+          var ne = be.nodesById.get(extra.node_id);
+          if (ne) ne.offloaded = false;
+          var st = be._offloadStartT.get(extra.node_id);
+          if (st != null) {
+            be.offloadMs += Math.max(0, Math.round((ev.t - st) * 1000));
+            be._offloadStartT.delete(extra.node_id);
+          }
+        }
+        activeOffloads.delete(traceId + ":" + extra.node_id);
         continue;
       }
     }
@@ -870,13 +1078,36 @@
   }
   function branchState(b) {
     if (b.done) return "DONE";
+    // The loop is frozen inside this request right now. Outranks everything —
+    // it is the single most important thing on the screen.
+    if (b.stalled) return "STALLED";
     if (b.zone === "pool") return b.stack.length ? "RUNNING" : "WAITING";
-    if (loopHolder === b.traceId) {
-      if (virtualT !== null && b.lastEventT && virtualT - b.lastEventT > UNTRACED_AFTER) {
-        return "UNTRACED";
-      }
-      return "RUNNING";
-    }
+
+    // Order matters, and it is not obvious. One trace can be BOTH offloading
+    // and running on the loop at the same time: the task factory copies a
+    // parent's trace id onto its child tasks, so `gather(run_in_threadpool(a),
+    // b())` gives one trace a worker-bound child and a loop-bound sibling.
+    // Checking liveOffloads first reported "WAITING · worker" while the loop
+    // was demonstrably busy with this very request — the exact untruth this
+    // zone work set out to remove.
+    //
+    // So a FRESH loop-holder claim wins: if the loop produced an in-root event
+    // for this trace within UNTRACED_AFTER, the loop is running it, full stop.
+    var holding = loopHolder === b.traceId;
+    var stale =
+      virtualT !== null && b.lastEventT && virtualT - b.lastEventT > UNTRACED_AFTER;
+    if (holding && !stale) return "RUNNING";
+
+    // Parked at an await whose work is on a worker thread. Still WAITING as
+    // far as the loop is concerned (the loop is free either way) — but worth
+    // distinguishing from waiting on i/o, because a worker is busy for it.
+    // This also outranks a STALE holder claim: "a worker is definitely busy"
+    // beats "the loop last touched this trace a while ago".
+    if (b.liveOffloads > 0) return "WORKER";
+
+    // Held the loop, but has gone quiet — the loop is off in code outside the
+    // configured roots, so we cannot claim this frame is the one running.
+    if (holding) return "UNTRACED";
     return "WAITING";
   }
 
@@ -936,12 +1167,29 @@
     if (zone === "loop") {
       ctx.fillText("EVENT LOOP", 12, ty);
       ctx.font = "10px monospace";
-      ctx.fillStyle = "#8b949e";
-      ctx.fillText(
-        "1 thread · one runs at a time · " + liveCount + " live · " + list.length + " shown",
-        12,
-        ty + 14
-      );
+      if (loopStalled) {
+        // Summary lives in the header, which is a dedicated strip. Drawing it
+        // over the spine put it on top of the first row's own header.
+        ctx.fillStyle = "#f85149";
+        var heldS =
+          virtualT !== null ? Math.max(0, virtualT - loopStalled.sinceT) : 0;
+        // Name both ends: the app frame you can change, and the deepest frame,
+        // which says WHAT it is stuck in (socket.recv, a driver call) and is
+        // usually library code the monitor never traces.
+        var stallLabel =
+          "⏱ LOOP STALLED " + heldS.toFixed(1) + "s in " + loopStalled.qualname;
+        if (loopStalled.deepest && loopStalled.deepest !== loopStalled.qualname) {
+          stallLabel += " → " + loopStalled.deepest;
+        }
+        ctx.fillText(stallLabel, 12, ty + 14);
+      } else {
+        ctx.fillStyle = "#8b949e";
+        ctx.fillText(
+          "1 thread · one runs at a time · " + liveCount + " live · " + list.length + " shown",
+          12,
+          ty + 14
+        );
+      }
     } else {
       var total = pool.total || POOL_DEFAULT_TOTAL;
       var borrowed = pool.borrowed || 0;
@@ -975,37 +1223,36 @@
     ctx.stroke();
     ctx.restore();
 
-    // Blocking flash (task 3): a coroutine is freezing the loop. Overpaint the
-    // whole loop spine red + label; it takes precedence over the holder marker
-    // (the block IS what's holding the loop, just not yielding).
-    if (zone === "loop" && loopBlocked) {
+    // Live stall: the watchdog says the loop is not responding AT THIS MOMENT.
+    // Takes precedence over the retrospective blocking flash below — if we know
+    // it is stuck right now, say that rather than reporting a past span.
+    if (zone === "loop" && loopStalled) {
       ctx.save();
       ctx.strokeStyle = "#f85149";
       ctx.shadowColor = "#f85149";
-      ctx.shadowBlur = 12;
-      ctx.lineWidth = 4;
+      ctx.shadowBlur = 14;
+      ctx.lineWidth = 5;
       ctx.beginPath();
       ctx.moveTo(spine.x, spine.top);
       ctx.lineTo(spine.x, spine.bottom);
       ctx.stroke();
       ctx.restore();
 
-      ctx.save();
-      ctx.fillStyle = "#f85149";
-      ctx.font = "bold 11px monospace";
-      ctx.textAlign = "left";
-      ctx.textBaseline = "top";
-      var secs = (loopBlocked.duration_ms / 1000).toFixed(2);
-      ctx.fillText(
-        "🔥 BLOCKED by " + loopBlocked.qualname + " (" + secs + "s)",
-        spine.x + 10,
-        spine.top + 2
-      );
-      ctx.restore();
-      ctx.textAlign = "left";
-      ctx.textBaseline = "alphabetic";
+      // No text here: the spine's top is exactly where the first row draws its
+      // own "#id  STATE" header, and the two overlapped into unreadable mush.
+      // The wording lives in the zone header (drawZoneHeader) and on the
+      // stalled row itself; the red spine is the at-a-glance signal.
       return;
     }
+
+    // There is deliberately no separate "BLOCKED" banner here any more. It
+    // reused 🔥, which now means "waited on the outside world", so one icon
+    // carried two meanings; it appeared for about a second and then vanished;
+    // and it said what the row's own durable tag already says. Three signals
+    // now cover the ground without overlapping: ⏱ stalled (right now),
+    // 🔥 blocking I/O (waited on something), ⚙ held the loop (long, cause
+    // unknown). The hot ring lives on the NODE (node.blocking), set when
+    // the event is ingested, so removing the banner cost nothing.
 
     if (zone !== "loop" || !loopHolder) return;
     var hb = branches.get(loopHolder);
@@ -1128,6 +1375,19 @@
     // Expires on the same real-time window as the spine flash.
     if (node.blocking && node.blockUntil && performance.now() > node.blockUntil) {
       node.blocking = false;
+    }
+    if (loopStalled && loopStalled.node_id != null && node.id === loopStalled.node_id) {
+      node.blocking = true; // frozen right now — same hot ring as a blocking span
+    }
+    if (node.wasBlocking && !node.blocking) {
+      // The hot ring expires on a timer; this is the calm, permanent marker
+      // so the culprit is still identifiable on a finished row.
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#f85149";
+      ctx.strokeRect(x - w / 2 - 2, y - h / 2 - 2, w + 4, h + 4);
+      ctx.restore();
     }
     if (node.blocking) {
       ctx.save();
@@ -1265,6 +1525,8 @@
     RUNNING: { glyph: "●", color: "#3fb950", label: "RUNNING" },
     WAITING: { glyph: "○", color: "#8b949e", label: "WAITING" },
     UNTRACED: { glyph: "⋯", color: "#d29922", label: "UNTRACED" },
+    WORKER: { glyph: "⇢", color: "#f0883e", label: "WAITING · worker" },
+    STALLED: { glyph: "⏱", color: "#f85149", label: "STALLED" },
     DONE: { glyph: "✓", color: "#6e7681", label: "DONE" },
   };
 
@@ -1307,71 +1569,179 @@
       x += ctx.measureText(outcome).width + 12;
     }
 
-    // Durable "blocked" tag: this request froze the loop at some point. Shown
-    // alongside the live state (e.g. "✓ DONE  200 · 302ms  🔥 blocked 0.30s"),
-    // so a finished request still records that it blocked — not just a flash.
-    if (b.blocked) {
+    // Durable "⇢ pool" tag: this request handed work to a worker thread at
+    // some point. The row never moves zones, and the pool-zone entry only
+    // exists while the call runs — so without this a finished request shows
+    // no sign it used a worker at all.
+    if (b.offloadCount) {
+      ctx.fillStyle = "hsl(30, 90%, 62%)";
+      var ptag = "⇢ pool";
+      if (b.offloadCount > 1) ptag += " ×" + b.offloadCount;
+      if (b.offloadMs) ptag += " " + b.offloadMs + "ms";
+      ctx.fillText(ptag, x, y);
+      x += ctx.measureText(ptag).width + 12;
+    }
+
+    // The verdict, split into its two genuinely different kinds.
+    //
+    //   🔥 blocking I/O — the loop thread waited on the outside world. A bug at
+    //      ANY speed, so this shows even when nothing tripped a threshold; it
+    //      is the only signal that catches a 3ms database call.
+    //   ⚙ held the loop — it ran too long, and we have NO evidence of what it
+    //      was doing. Deliberately not called "CPU-bound": the absence of a
+    //      detected wait is not proof of computation. `time.sleep` raises no
+    //      audit event and leaves no Python frame (it is C), and neither does a
+    //      read on an already-open socket — so the most iconic blocking call of
+    //      all would have been mislabelled as computation. Same principle as
+    //      the UNTRACED state: never look more certain than the instrumentation
+    //      actually is.
+    if (b.ioCalls.size) {
       ctx.fillStyle = "#f85149";
-      var tag = "🔥 blocked";
-      if (b.blockedMs) tag += " " + (b.blockedMs / 1000).toFixed(2) + "s";
-      ctx.fillText(tag, x, y);
+      var kinds = [];
+      b.ioCalls.forEach(function (c) {
+        kinds.push(c);
+      });
+      // Terse: the CATEGORY stays (two words, and it is the kind of problem),
+      // but function names moved to the inspector — fine for one blocking call
+      // and unreadable for several.
+      var iotag = "🔥 blocking I/O: " + kinds.sort().join(", ");
+      if (b.blockedMs) iotag += " " + (b.blockedMs / 1000).toFixed(2) + "s";
+      if (b.blockCount > 1) iotag += " ×" + b.blockCount;
+      ctx.fillText(iotag, x, y);
+    } else if (b.blocked) {
+      ctx.fillStyle = "#d29922";
+      var cputag = "⚙ held the loop";
+      if (b.blockedMs) cputag += " " + (b.blockedMs / 1000).toFixed(2) + "s";
+      if (b.blockCount > 1) cputag += " ×" + b.blockCount;
+      ctx.fillText(cputag, x, y);
     }
 
     ctx.textBaseline = "alphabetic";
     ctx.restore();
   }
 
-  function drawBranchCollapsed(b, spine, rowY, alpha, activeId, holds) {
-    var chain = [b.rootNode];
-    for (var i = 0; i < b.stack.length; i++) {
-      var n = b.nodesById.get(b.stack[i]);
-      if (n) chain.push(n);
+  // Which nodes a COLLAPSED row shows, and where they sit.
+  //
+  // Shared by the layout pass (which needs the height) and the draw pass. The
+  // shape is a small TREE, not a chain: positions come from real call depth,
+  // and nodes at the same depth are siblings stacked vertically. Laying it out
+  // by array order instead drew two siblings in a horizontal line, which reads
+  // as "the left one called the right one" — flatly wrong for two blocking
+  // calls made from the same handler.
+  function collapsedShape(b) {
+    var picked = [b.rootNode];
+    var seen = {};
+    seen[b.rootNode.id] = true;
+
+    function add(n) {
+      if (!n || seen[n.id]) return;
+      picked.push(n);
+      seen[n.id] = true;
     }
-    var maxDepth = chain.length - 1;
+
+    // the active call path
+    for (var i = 0; i < b.stack.length; i++) add(b.nodesById.get(b.stack[i]));
+
+    // Only the active path. Pinning the frames that blocked was tried and
+    // reverted: on a finished row it left several wide nodes hanging around,
+    // colliding with the row's own tag, for information that belongs in the
+    // inspector. Running rows show what is running; finished rows collapse
+    // back to the request.
+
+    function depthOf(n) {
+      if (n.isRoot) return 0;
+      var d = 1;
+      var cur = n;
+      var guard = 0;
+      while (cur.parent_id != null && guard++ < 64) {
+        var parent = b.nodesById.get(cur.parent_id);
+        if (!parent) break;
+        d++;
+        cur = parent;
+      }
+      return d;
+    }
+
+    var byDepth = {};
+    var maxDepth = 0;
+    for (var j = 0; j < picked.length; j++) {
+      var d = depthOf(picked[j]);
+      if (d > maxDepth) maxDepth = d;
+      (byDepth[d] = byDepth[d] || []).push(picked[j]);
+    }
+
+    var maxSiblings = 1;
+    var placed = [];
+    for (var dd in byDepth) {
+      var row = byDepth[dd];
+      if (row.length > maxSiblings) maxSiblings = row.length;
+      for (var q = 0; q < row.length; q++) {
+        placed.push({ node: row[q], depth: Number(dd), slot: q, of: row.length });
+      }
+    }
+    return { placed: placed, maxDepth: maxDepth, maxSiblings: maxSiblings };
+  }
+
+  function drawBranchCollapsed(b, spine, rowY, alpha, activeId, holds) {
+    var shape = collapsedShape(b);
     var availW = canvas.width - ROOT_X - MARGIN;
-    var scaleX = maxDepth > 0 ? Math.min(1, availW / (maxDepth * NODE_SPACING_X)) : 1;
+    var scaleX =
+      shape.maxDepth > 0 ? Math.min(1, availW / (shape.maxDepth * NODE_SPACING_X)) : 1;
     var scale = Math.max(MIN_SCALE, scaleX);
 
-    var prevX = spine.x;
-    var lastX = ROOT_X;
+    // position everything first, so an edge can start at its real PARENT
+    // rather than at whatever happened to be drawn before it
+    var pos = {};
+    for (var i = 0; i < shape.placed.length; i++) {
+      var e = shape.placed[i];
+      pos[e.node.id] = {
+        x: ROOT_X + e.depth * NODE_SPACING_X * scale,
+        y: rowY + (e.slot - (e.of - 1) / 2) * SIBLING_GAP * scale,
+      };
+    }
 
-    for (var c = 0; c < chain.length; c++) {
-      var node = chain[c];
-      var x = ROOT_X + c * NODE_SPACING_X * scale;
-      var edgeColor = "hsl(" + b.hue + ", 60%, 50%)";
+    var edgeColor = "hsl(" + b.hue + ", 60%, 50%)";
+    var rightmost = ROOT_X;
+
+    for (var m = 0; m < shape.placed.length; m++) {
+      var node = shape.placed[m].node;
+      var p = pos[node.id];
+      if (p.x > rightmost) rightmost = p.x;
 
       if (node.isRoot) {
         drawEdge(
           spine.x,
           rowY,
-          x,
-          rowY,
+          p.x,
+          p.y,
           holds ? "hsl(" + b.hue + ", 90%, 65%)" : edgeColor,
           alpha * (holds ? 1 : 0.45),
           !holds,
           holds ? 2.5 : 1.5
         );
       } else {
+        var parentPos =
+          node.parent_id != null && pos[node.parent_id]
+            ? pos[node.parent_id]
+            : pos[b.rootNode.id];
         var edgeAlpha = alpha;
         var dashed = false;
         if (node.state === "suspended" && !node.offloaded) {
           edgeAlpha = alpha * 0.3;
           dashed = true;
         }
-        drawEdge(prevX, rowY, x, rowY, edgeColor, edgeAlpha, dashed, 1.5);
+        drawEdge(parentPos.x, parentPos.y, p.x, p.y, edgeColor, edgeAlpha, dashed, 1.5);
       }
 
-      drawNode(node, x, rowY, NODE_W * scale, NODE_H * scale, scale, alpha, b.hue, activeId, null);
-      prevX = x;
-      lastX = x;
+      drawNode(node, p.x, p.y, NODE_W * scale, NODE_H * scale, scale, alpha, b.hue, activeId, null);
     }
 
     drawExpandArrow(ROOT_X, rowY, scale, false);
 
-    var drawnFromNodesById = chain.length - 1; // chain minus the synthetic root
-    var hidden = b.nodesById.size - drawnFromNodesById;
+    var shown = shape.placed.length - 1; // minus the synthetic request root
+    var hidden = b.nodesById.size - shown;
     if (hidden > 0) {
-      drawBadge(lastX + (NODE_W * scale) / 2 + 10, rowY, hidden, alpha);
+      drawBadge(rightmost + (NODE_W * scale) / 2 + 10, rowY, hidden, alpha);
     }
   }
 
@@ -1460,6 +1830,62 @@
     if (rootPos) drawExpandArrow(rootPos.x, rootPos.y, scale, true);
   }
 
+  // One offloaded call currently executing on a worker thread. This is NOT a
+  // request — the owning request is parked on the event loop and keeps its row
+  // there. This is the unit of work the worker runs on its behalf, so it is
+  // labelled with the owner's #id and drawn in the owner's hue.
+  function drawWorkRow(item, spine, rowY) {
+    var w = NODE_W;
+    var h = NODE_H;
+    var x = ROOT_X;
+
+    drawEdge(spine.x, rowY, x - w / 2, rowY, "hsl(30, 90%, 60%)", 0.9, true, 1.5);
+
+    ctx.save();
+    ctx.fillStyle = "hsl(" + item.hue + ", 55%, 26%)";
+    ctx.strokeStyle = "hsl(30, 90%, 55%)";
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(x - w / 2, rowY - h / 2, w, h);
+    ctx.strokeRect(x - w / 2, rowY - h / 2, w, h);
+    ctx.fillStyle = "#e6edf3";
+    ctx.font = "11px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(truncate(item.qualname, 18), x, rowY);
+    ctx.restore();
+
+    ctx.save();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    var ty = rowY - h / 2 - 4;
+    ctx.font = "bold 11px monospace";
+    ctx.fillStyle = "hsl(" + item.hue + ", 60%, 72%)";
+    var idText = "#" + item.shortId;
+    ctx.fillText(idText, x - w / 2, ty);
+    ctx.font = "10px monospace";
+    ctx.fillStyle = "#f0883e";
+    var elapsed =
+      virtualT !== null ? Math.max(0, Math.round((virtualT - item.startT) * 1000)) : 0;
+    ctx.fillText(
+      "⇢ on worker " + elapsed + "ms",
+      x - w / 2 + ctx.measureText(idText).width + 10,
+      ty
+    );
+    ctx.restore();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+
+    hoverRects.push({
+      x: x - w / 2,
+      y: rowY - h / 2,
+      w: w,
+      h: h,
+      qualname: item.qualname,
+      awaiting: "running on a worker thread for #" + item.shortId,
+      awaitDone: false,
+    });
+  }
+
   function drawTooltip() {
     if (mouseX < 0) return;
     for (var i = hoverRects.length - 1; i >= 0; i--) {
@@ -1496,18 +1922,38 @@
   // Draw one zone: its header, spine, and row stack (clipped to the zone's
   // band, scrolled by its own offset). Returns the laid-out rows (for the
   // shared click/hover hit-test) and the clamped scroll offset.
-  function drawZone(zone, band, list, scrollVal) {
+  function drawZone(zone, band, list, scrollVal, work) {
     var spineTop = band.top + ZONE_HEADER_H;
     var spineBottom = Math.max(spineTop + 20, band.bottom);
     var bandRowsH = spineBottom - spineTop;
 
     var layout = layoutRowList(list);
+    // Live worker entries stack below the request rows in the same content
+    // space, so they scroll together and count toward the scrollable height.
+    var workRows = [];
+    if (work && work.length) {
+      var wy = layout.contentHeight;
+      for (var w = 0; w < work.length; w++) {
+        workRows.push({
+          item: work[w],
+          contentTop: wy,
+          height: WORK_ROW_H,
+          contentCenter: wy + WORK_ROW_H / 2,
+        });
+        wy += WORK_ROW_H + ROW_GAP;
+      }
+      layout.contentHeight = wy;
+    }
     var maxScroll = Math.max(0, layout.contentHeight - bandRowsH);
     var s = Math.max(0, Math.min(scrollVal, maxScroll));
 
     for (var i = 0; i < layout.rows.length; i++) {
       layout.rows[i].screenTop = spineTop + layout.rows[i].contentTop - s;
       layout.rows[i].screenCenter = spineTop + layout.rows[i].contentCenter - s;
+    }
+    for (var k = 0; k < workRows.length; k++) {
+      workRows[k].screenTop = spineTop + workRows[k].contentTop - s;
+      workRows[k].screenCenter = spineTop + workRows[k].contentCenter - s;
     }
 
     drawZoneHeader(zone, band, list);
@@ -1558,18 +2004,23 @@
       }
       drawRowHeader(b, state, row.screenCenter);
     }
+    for (var m = 0; m < workRows.length; m++) {
+      var wr = workRows[m];
+      if (wr.screenCenter < spineTop - wr.height || wr.screenCenter > spineBottom + wr.height) {
+        continue;
+      }
+      drawWorkRow(wr.item, spine, wr.screenCenter);
+    }
+
     poolZoneDraw = false;
     ctx.restore();
 
     drawScrollbar(spine, maxScroll, layout.contentHeight, s);
-    return { rows: layout.rows, scroll: s };
+    return { rows: layout.rows, work: workRows, scroll: s };
   }
 
   function render() {
     advancePlayback();
-
-    // Expire the blocking flash on its real-time window (see BLOCK_FLASH_*).
-    if (loopBlocked && performance.now() > loopBlocked.until) loopBlocked = null;
 
     // Resolve the hovered qualname from LAST frame's rects, before they are
     // cleared below — drawNode needs it while drawing THIS frame.
@@ -1589,12 +2040,25 @@
       (b.zone === "pool" ? poolList : loopList).push(b);
     });
 
+    // Offloaded calls running RIGHT NOW belong in the threadpool zone as their
+    // own entries — the worker is busy with them, while the request that asked
+    // for them stays parked in the loop zone. Honour the row filter through
+    // the owning request.
+    var poolWork = [];
+    activeOffloads.forEach(function (item) {
+      var owner = branches.get(item.traceId);
+      if (owner && matchesFilter(owner)) poolWork.push(item);
+    });
+    poolWork.sort(function (a, b) {
+      return a.startT - b.startT;
+    });
+
     // Divider sits proportionally to each zone's row count, clamped so both
     // headers always show.
     var top = ZONE_TOP;
     var bottom = canvas.height - ZONE_BOTTOM_MARGIN;
     var avail = Math.max(40, bottom - top);
-    var n = loopList.length + poolList.length;
+    var n = loopList.length + poolList.length + poolWork.length;
     var frac = n === 0 ? 0.5 : loopList.length / n;
     frac = Math.max(ZONE_MIN_FRAC, Math.min(ZONE_MAX_FRAC, frac));
     dividerY = top + frac * avail;
@@ -1605,7 +2069,7 @@
     var lr = drawZone("loop", loopBand, loopList, scrollLoop);
     scrollLoop = lr.scroll;
     drawDivider(dividerY);
-    var pr = drawZone("pool", poolBand, poolList, scrollPool);
+    var pr = drawZone("pool", poolBand, poolList, scrollPool, poolWork);
     scrollPool = pr.scroll;
 
     currentRows = lr.rows.concat(pr.rows); // shared click/scroll hit-test
@@ -1616,7 +2080,7 @@
       renderInspector();
     }
 
-    if (loopList.length === 0 && poolList.length === 0) {
+    if (loopList.length === 0 && poolList.length === 0 && poolWork.length === 0) {
       drawIdleHint(branches.size > 0);
     }
 
@@ -1726,7 +2190,7 @@
       blockedBefore.clear();
       pending = [];
       loopHolder = null;
-      loopBlocked = null;
+      loopStalled = null;
       selectedTrace = null;
       scrollLoop = 0;
       scrollPool = 0;
@@ -1857,16 +2321,45 @@
     );
     html += irow("call nodes", esc(b.nodesById.size));
     html += irow("suspends", esc(b.suspendCount));
-    html += irow(
-      "blocking",
-      b.blockCount
-        ? '<span class="bad">' +
-          esc(b.blockCount) +
-          " span(s), worst " +
+    if (b.ioCalls.size) {
+      var lines = b.ioDetails
+        .map(function (d) {
+          return esc(d.category) + (d.detail ? " " + esc(d.detail) : "");
+        })
+        .join("<br>");
+      html += irow("blocking I/O", '<span class="bad">' + lines + "</span>");
+    }
+    if (!b.ioCalls.size && b.blocked) {
+      html += irow(
+        "cause",
+        "unknown — no I/O detected. Either computation, or a wait we cannot " +
+          "see (time.sleep, a read on an open socket)"
+      );
+    }
+    if (b.blockSpans.length) {
+      var spans = b.blockSpans
+        .map(function (sp) {
+          return (
+            esc(sp.qualname) +
+            " &mdash; " +
+            (sp.ms == null ? "still running" : esc(sp.ms) + "ms")
+          );
+        })
+        .join("<br>");
+      html += irow(
+        "held the loop",
+        '<span class="bad">' +
           (b.blockedMs / 1000).toFixed(2) +
-          "s</span>"
-        : "none"
-    );
+          "s total over " +
+          b.blockSpans.length +
+          (b.blockSpans.length === 1 ? " span" : " spans") +
+          "<br>" +
+          spans +
+          "</span>"
+      );
+    } else {
+      html += irow("held the loop", "none");
+    }
     inspectorBody.innerHTML = html;
   }
 
