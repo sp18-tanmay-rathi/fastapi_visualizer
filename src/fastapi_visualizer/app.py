@@ -8,10 +8,11 @@ import os
 import sys
 import threading
 from contextlib import asynccontextmanager
+import re
 from pathlib import Path
 
 from starlette.applications import Starlette
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, PlainTextResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocketDisconnect
 
@@ -21,6 +22,11 @@ from .identity import TraceMiddleware
 from .monitor import Monitor
 
 STATIC_DIR = Path(__file__).parent / "static"
+# What the dashboard is allowed to ask for. A deliberately short list: this
+# directory holds the prebuilt frontend and nothing else should ever leave it.
+# The pattern permits `viz/theme.js` but cannot express `..` at all, because a
+# dot is only allowed in the extension.
+_STATIC_NAME = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\.(?:js|css|html|svg|woff2)$")
 
 ENV_FLAG = "FASTAPI_VIZ"
 _ENV_TRUTHY = ("1", "true", "yes", "on")
@@ -100,8 +106,34 @@ def _mount_dashboard(app, path: str) -> None:
     async def index(request):
         return FileResponse(STATIC_DIR / "index.html")
 
-    async def dashboard_js(request):
-        return FileResponse(STATIC_DIR / "dashboard.js")
+    async def static_asset(request):
+        """Serve one file from the static directory.
+
+        Replaces a hardcoded route per file, now that the frontend is several
+        scripts in a `viz/` subdirectory. This resolves a client-supplied name,
+        so it carries two INDEPENDENT guards and either alone would be enough:
+
+          1. The name must match `_STATIC_NAME` — segments of
+             `[A-Za-z0-9_-]` joined by single slashes, ending in an allowed
+             extension. A dot can only appear in that extension, so `..` is
+             unrepresentable and no amount of encoding produces one.
+          2. The resolved path must still be inside STATIC_DIR after
+             `resolve()`, which also closes off symlinks pointing outward.
+
+        Everything refused answers 404 with the same body as a genuinely
+        missing file, so probing cannot map what is here.
+        """
+        name = request.path_params.get("asset", "")
+        if not _STATIC_NAME.match(name or ""):
+            return PlainTextResponse("not found", status_code=404)
+        target = (STATIC_DIR / name).resolve()
+        try:
+            target.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            return PlainTextResponse("not found", status_code=404)
+        if not target.is_file():
+            return PlainTextResponse("not found", status_code=404)
+        return FileResponse(target)
 
     async def ws_endpoint(websocket):
         # The stream is push-only, but we MUST still read from the socket:
@@ -165,7 +197,7 @@ def _mount_dashboard(app, path: str) -> None:
     viz_app = Starlette(
         routes=[
             Route("/", index),
-            Route("/dashboard.js", dashboard_js),
+            Route("/{asset:path}", static_asset),
             WebSocketRoute("/ws", ws_endpoint),
         ]
     )

@@ -345,6 +345,42 @@ reqs →  │  event loop (1 thread)          AnyIO threadpool (≤40 tokens)   
 
 `kind` is one of the eleven values in the table above.
 
+### Frontend file layout
+
+The dashboard is several plain scripts loaded in order, not modules and not a
+bundle — it ships prebuilt and has to work offline with no build step.
+
+| file | holds |
+|---|---|
+| `static/viz/theme.js` | `VIZ.theme` — every colour, type size and radius the canvas draws with |
+| `static/viz/geometry.js` | `VIZ.geometry` — pure maths (`clipToBox`) |
+| `static/viz/primitives.js` | `VIZ.primitives(ctx, …)` — rounded rects, state chips, arrowed edges, bound to one context |
+| `static/viz/filter.js` | `VIZ.filter` — row-filter parsing and matching, pure |
+| `static/dashboard.js` | everything else: state, ingest, playback, layout, render |
+
+Only the genuinely **pure** parts moved. The core keeps ~20 pieces of shared
+mutable state (`branches`, `loopHolder`, `virtualT`, `pending`, `dividerY` …)
+written by one function and read by another; a reassignable `var` cannot be
+shared across files — not with script tags and not with ES modules, whose
+imported bindings are read-only — so splitting the core means moving every one
+of those reads and writes onto a state object. That is a much larger and much
+riskier change, and it is not what this split is.
+
+Each file attaches to `window.VIZ` and the next reads it, so **the order in
+`index.html` is load-bearing**. It is mirrored in `tests/js/_sources.js`, which
+the JS harnesses evaluate in sequence into one sandbox — so a file added,
+renamed or reordered without `index.html` agreeing fails a test rather than
+producing a blank dashboard.
+
+`app.py` serves them from one `Route("/{asset:path}", static_asset)`. Because
+that resolves a client-supplied name it carries two independent guards: a name
+pattern that cannot express `..` at all (a dot is only allowed in the
+extension), and a `resolve()`-inside-`STATIC_DIR` containment check that also
+closes off outward symlinks. Both are load-bearing: with them removed, plain
+`../app.py` is normalised away by Starlette's router, but **`..%2Fapp.py`
+survives and discloses source**. Refusals and genuine misses answer identically,
+so probing maps nothing. Covered by `tests/test_static_assets.py`.
+
 ## Frontend: the flow graph
 
 Single `<canvas>`, vanilla JS, no build step, no external dependencies —
@@ -352,6 +388,26 @@ works fully offline (`static/dashboard.js`). It is **view-only**: it never
 issues requests to the app; traffic is driven externally (curl, httpx,
 `examples/drive.py`, real users).
 
+- **Direction B, "Instrument".** A node's body stays dark whatever its state
+  and the state rides a 4px left stripe, rather than the body being flooded
+  with a saturated hue and the label sitting on top of it. That was the actual
+  cause of the old mushiness: the label's contrast moved with both the hue and
+  the state, and at 11px nothing survived. Tokens live in `viz/theme.js`.
+  Contrast against the ground went from 2.26:1 / 4.02:1 / 6.38:1 for the three
+  greys the old palette leaned on, to 5.9:1 / 5.5:1 / 9.4:1, and every type
+  size rose 1–2px.
+- **The canvas is DPR-scaled.** The backing store is sized
+  `clientWidth × devicePixelRatio` (capped at 2) with the context
+  pre-multiplied, so all layout maths stays in CSS px. Previously the bitmap
+  was 1:1 with its CSS box, so every glyph on a retina display was upscaled by
+  the browser — a good part of why the text read as washed out whatever colour
+  it was.
+- **Connectors run edge to edge, with a head.** `clipToBox` stops each end on
+  the two boxes' borders instead of at their centres, where both ends
+  disappeared underneath and nothing said which way the call went.
+- **The divider is draggable.** It still defaults to a proportion of the row
+  counts; dragging pins it (`splitFrac`), and double-clicking hands it back.
+  A pinned divider says so, because otherwise it just looks stuck.
 - **Two zones.** The canvas splits into a top **EVENT LOOP** zone (async
   requests — root frame `execution == "event_loop"`) and a bottom
   **THREADPOOL** zone (sync/offloaded requests — `execution == "threadpool"`).
@@ -433,7 +489,10 @@ issues requests to the app; traffic is driven externally (curl, httpx,
   click drains buffered events until the loop hands off to a different holder.
 - **Persistence**: finished requests stay (greyed "done" styling, root tagged
   green "✓ finished") instead of fading. "clear" wipes everything. "max req"
-  (default 10, 1–50) caps rows *kept*; at the cap the oldest **finished** row
+  (default 20, 1–50) caps rows *kept*; only `request_start` may create a row,
+  so a request refused at the cap is never shown rather than appearing later
+  mid-flight with a partial tree, and the count withheld is reported in the
+  alert strip. At the cap the oldest **finished** row
   is evicted, else a new trace is hidden.
 - **Dropped-event banner**: if the stream's `seq` skips (server shed events
   under load), the header shows "⚠ N events dropped — some traces may be

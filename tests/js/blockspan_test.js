@@ -16,8 +16,8 @@
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
+const { loadAll } = require("./_sources");
 
-const DASHBOARD = path.join(__dirname, "..", "..", "src", "fastapi_visualizer", "static", "dashboard.js");
 const T0 = 517342.5;
 const FRAME_MS = 16.7;
 
@@ -46,6 +46,13 @@ function harness() {
       id, textContent: "", value: "", hidden: false, checked: false, disabled: false,
       style: {}, innerHTML: "", classList: { add() {}, remove() {}, toggle() { return false; } },
       _h: {}, addEventListener(e, f) { this._h[e] = f; },
+      // The real DOM has these. The dashboard now drives tab state through
+      // aria-selected and focuses the filter box, so the stub needs them.
+      _attrs: {},
+      setAttribute(k, v) { this._attrs[k] = String(v); },
+      getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+      removeAttribute(k) { delete this._attrs[k]; },
+      focus() {}, blur() {}, select() {},
       getBoundingClientRect: () => ({ left: 0, top: 0 }),
       offsetHeight: 37, clientWidth: 1200, clientHeight: 800,
       getContext: () => ctx, width: 1200, height: 800,
@@ -54,7 +61,15 @@ function harness() {
   }
   let rafCb = null, ws = null;
   const sb = {
-    document: { getElementById: el, querySelector: () => el("header") },
+    document: {
+      getElementById: el,
+      querySelector: () => el("header"),
+      // Keyboard shortcuts bind at the document; `activeElement` is what the
+      // handler consults to avoid stealing Space from a focused input.
+      activeElement: null,
+      _keys: {},
+      addEventListener(ev, fn) { this._keys[ev] = fn; },
+    },
     window: { addEventListener() {}, innerWidth: 1200, innerHeight: 837 },
     performance: { now: () => clock },
     requestAnimationFrame: (cb) => { rafCb = cb; },
@@ -66,7 +81,7 @@ function harness() {
   };
   sb.self = sb;
   vm.createContext(sb);
-  vm.runInContext(fs.readFileSync(DASHBOARD, "utf8"), sb, { filename: DASHBOARD });
+  loadAll(vm, sb);
   ws.onopen();
   ws.onmessage({ data: JSON.stringify({ events: [
     { seq: 1, t: T0 - 60, kind: "pool_sample", trace_id: null, task_id: null, name: "tp",
@@ -196,7 +211,10 @@ check("a watchdog stall and the timer span for the SAME frame are one entry", ()
 // loop_stalled handler built `loopStalled` without ever copying node_id across
 // — so that test compared against `undefined` on every frame and the ring had
 // never once been painted, despite the backend sending the id all along.
-const HOT_RING = "#ff6a5f";
+// T.badHot in dashboard.js. Kept as a literal on purpose: if the palette
+// changes, this test should fail loudly and be re-baselined deliberately,
+// rather than silently following whatever the theme now says.
+const HOT_RING = "#ff7b73";
 
 function frozenAt(h, extra) {
   h.frame([

@@ -12,8 +12,8 @@
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
+const { loadAll } = require("./_sources");
 
-const DASHBOARD = path.join(__dirname, "..", "..", "src", "fastapi_visualizer", "static", "dashboard.js");
 const T0 = 517342.5;
 const FRAME_MS = 16.7;
 
@@ -39,6 +39,13 @@ function harness() {
       id, textContent: "", value: "", hidden: false, checked: false, disabled: false,
       style: {}, innerHTML: "", classList: { add() {}, remove() {}, toggle() { return false; } },
       _h: {}, addEventListener(e, f) { this._h[e] = f; },
+      // The real DOM has these. The dashboard now drives tab state through
+      // aria-selected and focuses the filter box, so the stub needs them.
+      _attrs: {},
+      setAttribute(k, v) { this._attrs[k] = String(v); },
+      getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+      removeAttribute(k) { delete this._attrs[k]; },
+      focus() {}, blur() {}, select() {},
       getBoundingClientRect: () => ({ left: 0, top: 0 }),
       offsetHeight: 37, clientWidth: 1200, clientHeight: 800,
       getContext: () => ctx, width: 1200, height: 800,
@@ -47,7 +54,15 @@ function harness() {
   }
   let rafCb = null, ws = null;
   const sb = {
-    document: { getElementById: el, querySelector: () => el("header") },
+    document: {
+      getElementById: el,
+      querySelector: () => el("header"),
+      // Keyboard shortcuts bind at the document; `activeElement` is what the
+      // handler consults to avoid stealing Space from a focused input.
+      activeElement: null,
+      _keys: {},
+      addEventListener(ev, fn) { this._keys[ev] = fn; },
+    },
     window: { addEventListener() {}, innerWidth: 1200, innerHeight: 837 },
     performance: { now: () => clock },
     requestAnimationFrame: (cb) => { rafCb = cb; },
@@ -59,7 +74,7 @@ function harness() {
   };
   sb.self = sb;
   vm.createContext(sb);
-  vm.runInContext(fs.readFileSync(DASHBOARD, "utf8"), sb, { filename: DASHBOARD });
+  loadAll(vm, sb);
   ws.onopen();
   ws.onmessage({ data: JSON.stringify({ events: [
     { seq: 1, t: T0 - 60, kind: "pool_sample", trace_id: null, task_id: null, name: "tp",
@@ -72,6 +87,13 @@ function harness() {
       for (let i = 0; i < n; i++) { clock += FRAME_MS; texts = []; placed = []; if (rafCb) rafCb(); }
     },
     drawn: () => texts.slice(),
+    el,
+    // Drive the row cap the way the header control does.
+    setMaxReq(v) {
+      const inp = el("ld-maxreq");
+      inp.value = String(v);
+      if (inp._h.input) inp._h.input({});
+    },
     at: (label) => placed.find((e) => e.s === label) || null,
     has: (frag) => texts.some((t) => t.includes(frag)),
     loopRows() {
@@ -536,6 +558,196 @@ check("a stall and its later loop_blocked are ONE span, not two", () => {
   if (!h.drawn().some((t) => t.includes("held the loop"))) {
     throw new Error("the hold was not reported at all");
   }
+});
+
+// A sync endpoint's row IS the worker, so a "⇢ pool" chip on it restates the
+// row's own zone — and puts a second, smaller number next to the request
+// total, which reads as a contradiction rather than a breakdown. The per-node
+// stub was already suppressed in this zone; the durable chip had been missed.
+check("a THREADPOOL row does not also carry a ⇢ pool chip", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/sync", request_id: null }),
+    enter(T0 + 0.001, 1, null, "threadpool", "sync_ep"),
+    ev(T0 + 0.002, "offload_start", { node_id: 1 }),
+    ev(T0 + 0.41, "offload_end", { node_id: 1 }),
+    ev(T0 + 0.411, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.72, "request_end", { status: 200, duration_ms: 718 }),
+  ]);
+  h.tick(1.5);
+  const chip = h.drawn().find((t) => t.indexOf("pool") >= 0 && /\d+ms/.test(t));
+  if (chip) throw new Error("threadpool row still carries: " + chip);
+});
+
+check("a LOOP row that offloaded still carries its ⇢ pool chip", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/offloaded", request_id: null }),
+    enter(T0 + 0.001, 1, null, "event_loop", "offloaded_ep"),
+    ev(T0 + 0.09, "suspend", { node_id: 1, awaiting: "run_in_threadpool" }),
+    enter(T0 + 0.10, 2, 1, "threadpool", "query_db"),
+    ev(T0 + 0.101, "offload_start", { node_id: 2 }),
+    ev(T0 + 0.30, "offload_end", { node_id: 2 }),
+    ev(T0 + 0.301, "call_exit", { node_id: 2 }),
+    ev(T0 + 0.302, "resume", { node_id: 1 }),
+    ev(T0 + 0.303, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.304, "request_end", { status: 200, duration_ms: 304 }),
+  ]);
+  h.tick(1.5);
+  if (!h.drawn().some((t) => t.indexOf("pool") >= 0))
+    throw new Error("a loop row that used a worker lost its evidence: " + h.drawn().join(" | "));
+});
+
+// The one place the tool can honestly say "waiting FOR a worker": the limiter
+// reports how many calls are queued for a free thread. It arrives on every
+// pool_sample and had never been displayed anywhere.
+check("a saturated pool reports how many calls are waiting for a thread", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    { seq: 900, t: T0, kind: "pool_sample", trace_id: null, task_id: null, name: "tp",
+      extra: { borrowed: 40, total: 40, queued: 7 } },
+  ]);
+  h.tick(0.5);
+  if (!h.has("7 waiting for a free thread"))
+    throw new Error("queue depth not surfaced: " + h.drawn().join(" | "));
+});
+
+check("an idle pool does not mention a queue at all", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    { seq: 901, t: T0, kind: "pool_sample", trace_id: null, task_id: null, name: "tp",
+      extra: { borrowed: 0, total: 40, queued: 0 } },
+  ]);
+  h.tick(0.5);
+  if (h.has("waiting for a free thread"))
+    throw new Error("an idle pool should say nothing about queueing");
+});
+
+// --- a request refused by the row cap keeps its name ----------------------
+//
+// getOrCreateBranch refuses a new trace at the cap when nothing kept is done,
+// and deliberately retries later. But method/path ride only on request_start,
+// so by the time the trace was admitted its identity had gone and the row drew
+// "? ?". Fifty concurrent requests at a ten-row cap lost forty names.
+
+// MAX_REQ defaults to 10, so eleven never-finishing requests overflow it
+// without needing to drive the header control.
+function startRequest(h, tid, path, t, node) {
+  h.frame([
+    { seq: seq++, t: t, kind: "request_start", trace_id: tid, task_id: 1, name: "r",
+      extra: { method: "GET", path: path, request_id: null } },
+    { seq: seq++, t: t + 0.001, kind: "call_enter", trace_id: tid, task_id: 1, name: "f",
+      extra: { node_id: node, parent_id: null, qualname: "handler",
+               file: "a.py", line: 1, is_async: true, execution: "event_loop" } },
+  ]);
+}
+
+check("a request the cap turned away is not shown at all", () => {
+  const h = harness();
+  h.tick(1);
+  h.setMaxReq(2);
+  h.tick(0.2);
+
+  // fill both slots with requests that never finish
+  startRequest(h, "cap0000000000000", "/held0", T0, 500);
+  startRequest(h, "cap0000000000001", "/held1", T0 + 0.001, 501);
+  // the third has nowhere to go
+  startRequest(h, "late000000000001", "/third", T0 + 0.02, 600);
+  h.tick(0.8);
+
+  // free a slot, then send a LATER event for the refused trace. It must NOT
+  // materialise a row: that row would appear to start late and its tree would
+  // be missing every call made while it was refused.
+  h.frame([
+    { seq: seq++, t: T0 + 0.30, kind: "call_exit", trace_id: "cap0000000000000",
+      task_id: 1, name: "f", extra: { node_id: 500 } },
+    { seq: seq++, t: T0 + 0.31, kind: "request_end", trace_id: "cap0000000000000",
+      task_id: 1, name: "r", extra: { status: 200, duration_ms: 310 } },
+    { seq: seq++, t: T0 + 0.40, kind: "call_enter", trace_id: "late000000000001",
+      task_id: 1, name: "f",
+      extra: { node_id: 601, parent_id: null, qualname: "handler",
+               file: "a.py", line: 1, is_async: true, execution: "event_loop" } },
+  ]);
+  h.tick(1.5);
+
+  const drawn = h.drawn().join(" | ");
+  if (/\? \?/.test(drawn))
+    throw new Error("a refused request materialised a nameless row: " + drawn);
+  if (drawn.indexOf("/third") >= 0)
+    throw new Error("a refused request appeared late, mid-flight: " + drawn);
+});
+
+check("the requests it withheld are counted in the alert strip", () => {
+  const h = harness();
+  h.tick(1);
+  h.setMaxReq(2);
+  h.tick(0.2);
+  startRequest(h, "cap0000000000000", "/held0", T0, 500);
+  startRequest(h, "cap0000000000001", "/held1", T0 + 0.001, 501);
+  startRequest(h, "late000000000001", "/x", T0 + 0.02, 600);
+  startRequest(h, "late000000000002", "/y", T0 + 0.03, 601);
+  h.tick(0.8);
+
+  const warn = h.el("cap-warn");
+  if (warn.hidden) throw new Error("two requests were withheld and nothing said so");
+  if (h.el("cap-count").textContent !== "2")
+    throw new Error("expected 2 withheld, got " + h.el("cap-count").textContent);
+});
+
+check("nothing is withheld when the cap is not reached", () => {
+  const h = harness();
+  h.tick(1);
+  startRequest(h, "aaaaaaaaaaaaaaa1", "/one", T0, 500);
+  h.tick(0.6);
+  if (!h.el("cap-warn").hidden)
+    throw new Error("the cap notice showed with room to spare");
+});
+
+// --- the busy count cannot be sampled away --------------------------------
+//
+// pool_sample is pushed only when the numbers change, and is polled from a
+// task on the loop — so it can be stale while rows are visibly running, and
+// step mode freezes that window on screen.
+
+check("live offloads count as busy even with a stale pool sample", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    // the sampler last said nobody is busy...
+    { seq: seq++, t: T0, kind: "pool_sample", trace_id: null, task_id: null, name: "tp",
+      extra: { borrowed: 0, total: 40, queued: 0 } },
+    // ...while two offloads are demonstrably in flight
+    ev(T0 + 0.01, "request_start", { method: "GET", path: "/sync", request_id: null }),
+    enter(T0 + 0.011, 1, null, "threadpool", "sync_ep"),
+    ev(T0 + 0.012, "offload_start", { node_id: 1 }),
+    enter(T0 + 0.013, 2, 1, "threadpool", "query_db"),
+    ev(T0 + 0.014, "offload_start", { node_id: 2 }),
+  ]);
+  h.tick(0.8);
+  if (h.has("0/40 busy"))
+    throw new Error("header claims an idle pool while offloads run: " + h.drawn().join(" | "));
+  if (!h.has("2/40 busy"))
+    throw new Error("expected 2/40 busy, drawn: " + h.drawn().join(" | "));
+});
+
+check("the threadpool header reports live and shown, like the loop zone", () => {
+  const h = harness();
+  h.tick(1);
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/sync", request_id: null }),
+    enter(T0 + 0.001, 1, null, "threadpool", "sync_ep"),
+    ev(T0 + 0.30, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.31, "request_end", { status: 200, duration_ms: 310 }),
+  ]);
+  h.tick(1.2);
+  // one finished row: 0 live, 1 shown — which is what makes "0 busy" and a
+  // visible row stop looking like a contradiction
+  if (!h.has("0 live · 1 shown"))
+    throw new Error("threadpool header missing live/shown: " + h.drawn().join(" | "));
 });
 
 console.log(failures === 0 ? "\nall zone tests passed" : `\n${failures} failure(s)`);

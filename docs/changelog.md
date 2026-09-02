@@ -8,6 +8,142 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Dashboard redesign — "Instrument".** A node's state now rides a 4px left
+  stripe instead of flooding the body with a saturated hue under white text,
+  which was the actual cause of the old illegibility. Contrast for the three
+  greys the palette leaned on went from 2.26:1 / 4.02:1 / 6.38:1 to
+  5.9:1 / 5.5:1 / 9.4:1, and every type size rose 1–2px. All tokens live in
+  `static/viz/theme.js`.
+- **The canvas is DPR-scaled.** The backing store is sized to
+  `devicePixelRatio` (capped at 2) with the context pre-multiplied, so layout
+  maths stays in CSS px. Text on retina displays was previously upscaled by the
+  browser, which no colour change could have fixed.
+- **Connectors point.** Edges run border-to-border with an arrowhead instead of
+  centre-to-centre with both ends hidden under the boxes.
+- **The zone divider can be dragged**, with a grip and a `ns-resize` cursor;
+  double-click returns it to the automatic proportion.
+- **Row tags are chips** on a tinted ground rather than bare glyphs, so a 10px
+  icon is findable on a near-black canvas and reads with its label.
+- **A zone's minimum size is now in pixels, not a fraction.** 26% of a laptop
+  screen came out shorter than a zone's own header, so its first row drew on
+  top of the header text; and `spineBottom` was forced to a minimum that
+  deliberately overflowed the band. Each zone now keeps its header plus one
+  collapsed row, and rows never draw outside their band.
+- **Depth spacing widened 150px → 184px.** Against a 140px node the old gap was
+  10px and an arrowhead is 7 of them, so connected boxes read as touching.
+- **The "✓ finished" caption under a request root is gone** — the row header
+  already carries a ✓ DONE chip and the outcome, so it repeated itself and
+  collided with the tree drawn beneath it.
+- **The pinned-divider hint moved above the line and only shows on hover.** On
+  the line, the divider struck through it.
+- **Per-call timing on expanded rows.** Every ingredient was already in the
+  stream (`call_enter` / `call_exit` / `suspend` / `resume` all carry `ev.t`),
+  so this costs nothing on the wire. Three forms, each saying only what can be
+  proved: `80ms on loop`, `202ms · 0ms on loop` (took 202ms, parked for all of
+  it, cost nobody), `205ms on worker`.
+
+  A frame **with children** deliberately shows elapsed only. `sys.monitoring`
+  emits suspend/resume for the frame that actually yields and never for its
+  callers, so a parent has no record of the time its children spent parked;
+  `elapsed - awaitMs` applied to one counts that as loop occupancy. Measured on
+  a real capture: an endpoint that held the loop for 80ms was reported as
+  holding it for 282. Sibling spacing widened 40px → 58px to fit the line.
+- **The durable `⇢ pool` chip no longer appears on THREADPOOL rows.** That row
+  already *is* a worker, so the chip restated the row's own zone and put a
+  second, smaller number beside the request total, reading as a contradiction
+  rather than a breakdown. The per-node `⇢ pool` stub was already suppressed
+  in that zone; this chip was the marker that had been missed. The
+  total-versus-worker split moved to the Request card, where it can be named:
+  `on a worker 410ms` and `not on a worker 308ms`, the latter explicitly not
+  attributed to a cause (queueing, framework overhead and a loop frozen by
+  someone else are indistinguishable here).
+- **The row cap defaults to 20 instead of 10.** Ten is below the concurrency
+  people actually drive at the tool, so the cap was being hit in ordinary use.
+  The fallback used when the box is cleared moved with it — left at 10 it would
+  have snapped the cap back to the old default silently. Still adjustable in
+  the header (1–50) and deliberately *not* also a `visualize()` argument: two
+  ways to set one value only invites them disagreeing.
+- **A row is complete or absent — never partly invented.** Only
+  `request_start` can create one now; `call_enter` used to as well, which is
+  how a request refused at the row cap still turned up later, built by
+  whichever event arrived once a slot freed. That row was wrong twice over: it
+  appeared to **start late**, so fifty simultaneous requests rendered as a
+  staggered trickle — the exact opposite of what this tool exists to show —
+  and every `call_enter` that arrived while it was refused had been dropped, so
+  its tree was missing frames and the request looked like it did less work than
+  it did. Measured: 50 concurrent requests at a 10-row cap produced forty such
+  rows, each drawing `? ?` because `method`/`path` ride only on
+  `request_start`.
+
+  Withheld requests are now counted in the alert strip —
+  `⚠ 12 requests not shown — raise rows to see them` — so the cap can never
+  distort the concurrency picture silently.
+
+  Two consequences worth stating. Requests already in flight when the dashboard
+  connects no longer appear at all, since their `request_start` predates the
+  connection and the collector does not replay (open the page first, as the
+  README says). And a `request_start` lost to event shedding takes its whole
+  row with it rather than leaving a partial one — the `seq`-gap drop warning
+  already covers that case.
+- **The busy count can no longer be sampled away.** `threadpool.py` polls the
+  limiter from a task *on the event loop* and pushes a sample only when the
+  numbers change, so the header could read `0/40 busy` with rows visibly
+  running — and step mode freezes that window on screen indefinitely. The
+  header now shows `max(sampled, observed)`, where observed is the live
+  offload count derived from `offload_start`/`offload_end`, which cannot be
+  sampled away. Each source can only under-report (the sampler misses windows;
+  the observed count misses rows evicted by the cap), so the larger is right in
+  both directions and neither can invent a busy worker. Measured: 50 concurrent
+  requests produced **three** samples for the whole run.
+- **The threadpool header reports live and shown**, matching the loop zone's
+  `0 live · 8 shown`. Without it, a zone full of finished rows next to
+  `0/40 busy` read as a contradiction rather than as "these are all done".
+- **The threadpool header reports calls queued for a free thread.** The limiter
+  has always sent `queued` on every `pool_sample` and nothing ever displayed
+  it. It is the one place the tool can honestly say "waiting *for* a worker" —
+  a row can only ever say a worker is already running its call, because the
+  limiter knows how many calls are waiting but not which request each belongs
+  to.
+- **`WAITING · worker` says what it means.** The old wording read as "waiting
+  for a worker to become free", which is a different state; it means a worker
+  already *has* the work while the coroutine is parked.
+- **The empty state is a card inside the EVENT LOOP band.** Centred on the
+  whole canvas it landed on the divider — the line struck through the sentence
+  and the drag grip sat on top of one of its words. It now centres in the band
+  where rows would actually appear, and in the graph area rather than under the
+  side panel, whose width it reads from the element instead of duplicating.
+- **The guide explains the loop-holder spine dot again.** It had been trimmed
+  as redundant with the RUNNING chip, which was wrong — the chip is a row's
+  state, the dot is where to look on the spine, and it is the single most
+  important thing on the screen.
+- **The header is grouped** into playback / show / filter / clear with
+  micro-labels, and the dropped-event and multi-worker warnings moved to their
+  own strip. They used to sit inside the header's flex row, so raising one
+  shifted every control sideways. `max req` and `slow req` are now `rows` and
+  `slow over`, which say what they are.
+- **One side panel with two tabs** replaces the stacked legend and inspector,
+  which had been competing for the same column and so both had to scroll.
+  *What am I looking at?* is the default — the request pane is empty until you
+  click something, so leading with it greeted a first run with nothing.
+  Clicking a row always brings *Request* forward; deselecting returns the guide.
+- **Keyboard**: `Space` steps while step mode is on (ignored when a field has
+  focus, so a space in a filter term is still a space) and `/` focuses the
+  filter. Visible `:focus-visible` rings throughout, and the canvas is
+  focusable. There were previously zero keyboard handlers and zero ARIA
+  attributes.
+- **The frontend is split.** `static/viz/theme.js`, `geometry.js`,
+  `primitives.js` and `filter.js` hold the genuinely pure parts; the coupled
+  core (state, ingest, playback, render) stays in `dashboard.js`, because
+  sharing reassignable state across files would mean moving every read and
+  write onto a state object. Plain ordered `<script>` tags, no build step. The
+  order is mirrored in `tests/js/_sources.js` so a mismatch fails a test rather
+  than blanking the dashboard.
+- **One static route replaces a hardcoded route per file**, with two
+  independent guards: a name pattern that cannot express `..`, and a
+  `resolve()` containment check. Both matter — without them Starlette
+  normalises plain `../app.py` away, but `..%2Fapp.py` reaches the handler and
+  discloses source. Refusals are indistinguishable from genuine misses.
+
 - **Blocking detection v2 — two more detectors alongside the timer.** The
   original threshold timer answers only "did a frame run long?", which is both
   retrospective (a server hung *right now* shows nothing) and duration-based (a
@@ -191,7 +327,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   collectable; a tuple of detectors would have quietly defeated the `WeakSet`.
   An outer `try/except` wraps the whole body regardless, per the project's
   fail-soft rule.
-
 - **A freeze in untraced code no longer blames an innocent request.**
   `Monitor._loop_close` cleared only `_active_node`/`_active_since`, so
   `_active_trace` kept pointing at the last request that ran in-root code for

@@ -103,11 +103,14 @@ Pass `roots=[...]` to trace additional/different directories.
 Drive traffic with your app as normal (real user actions, curl, httpx, a load
 tool) — the dashboard reflects whatever requests hit the app.
 
+The header groups its controls by what they do — **playback**, **show**,
+**filter**, and the destructive action on its own at the far right.
+
 - **speed** — slow-motion playback multiplier (0.05×–1.0×, default 0.2×),
   since real interleaving happens in milliseconds.
-- **max req** — max rows kept on screen (default 10, 1–50); at the cap the
-  oldest *finished* row is evicted to make room for a new live one.
-- **slow req** — duration threshold in ms (default 500); requests slower than
+- **rows** — how many requests are kept on screen (default 20, 1–50); at the
+  cap the oldest *finished* row is evicted to make room for a new live one.
+- **slow over** — duration threshold in ms (default 500); requests slower than
   this get an amber outcome tag and match the `slow:true` filter.
 - **filter** — hide rows that don't match. Space-separated terms, all of which
   must match: `path:/checkout`, `status:500`, `slow:true`,
@@ -117,23 +120,32 @@ tool) — the dashboard reflects whatever requests hit the app.
   loop hands off to a different request *or* a request finishes.
 - **clear** — wipes every displayed row.
 
+Two keys, for the things you repeat: **Space** takes one step while step mode
+is on (it is ignored while a field has focus, so a space in a filter term is
+still a space), and **/** jumps to the filter box.
+
+**Drag the divider** between the two zones to give one of them more room;
+double-click it to hand the split back to the automatic proportion.
+
 Each row is tagged with its runtime state and, once finished, its outcome —
 `200 · 42ms`, amber past the slow threshold, red for a 5xx or an unhandled
 exception.
 
-**Click a row** to open the request **inspector** (bottom-right, under the
-legend) and expand its
-call tree at the same time. The inspector shows the full trace id (selectable,
-for pasting into a log search), any inbound `X-Request-ID`, status, duration,
-execution zone, asyncio task count, call-node count, suspension count, and
-blocking spans.
+**Click a row** to inspect it and expand its call tree at the same time. The
+side panel has two tabs: *What am I looking at?* explains every state and
+marker on screen and is what you get by default, and *Request* shows the
+selected row — full trace id (selectable, for pasting into a log search), any
+inbound `X-Request-ID`, status, duration, execution zone, asyncio task count,
+call-node count, suspension count, and blocking spans. Clicking a row always
+brings *Request* forward; deselecting hands the panel back to the guide.
 
 Hover a node for its qualname, `file:line`, and await state — and to outline
 **that same function in every other row**, which shows where a shared helper
 is running across concurrent requests. Async requests appear in the top EVENT
 LOOP zone (one glows = holds the loop), sync ones in the bottom THREADPOOL zone
-(several run at once). If the server sheds events under load, a header banner
-reports how many were dropped. The dashboard is **view-only** — it never calls
+(several run at once). If the server sheds events under load, a strip under the
+header reports how many were dropped — it sits outside the header so raising a
+warning never shifts the controls. The dashboard is **view-only** — it never calls
 your app.
 
 ## Options

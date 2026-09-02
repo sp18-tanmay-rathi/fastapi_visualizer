@@ -34,14 +34,25 @@
 (function () {
   "use strict";
 
+  var VIZ = window.VIZ;
+  var T = VIZ.theme;
+  var MONO = VIZ.theme.mono;
+  var ARROW_HEAD = VIZ.theme.arrowHead;
+
   var POOL_DEFAULT_TOTAL = 40;
 
   // Layout constants (all in unrotated/unscaled canvas px; each row computes
   // its own scale factor to fit its call tree into its band — see drawBranch).
   var NODE_W = 140;
   var NODE_H = 32;
-  var NODE_SPACING_X = 150; // px per tree-depth level (deeper = further right)
-  var SIBLING_GAP = 40; // baseline px between sibling slots within a row band
+  // Depth spacing must leave a visible SHAFT between boxes, not just room for
+  // the head. At 150 against a 140-wide node the gap was 10px and the
+  // arrowhead alone is 7 of them, so connected boxes read as touching.
+  var NODE_SPACING_X = 184; // px per tree-depth level (deeper = further right)
+  // Slot PITCH, not gap: at 40 against a 32px node the space between two
+  // stacked siblings was 8px, which is not enough to hang a timing line under
+  // a box without it landing on the sibling below.
+  var SIBLING_GAP = 58; // baseline px between sibling slots within a row band
   var MARGIN = 20; // right-edge margin reserved so trees don't run off-canvas
   var SPINE_X = 70; // x of the vertical event-loop spine
   var ROOT_X = SPINE_X + 90; // x where each row's request-root node sits
@@ -64,8 +75,13 @@
   var ZONE_BOTTOM_MARGIN = 8; // bottom margin below the pool zone
   var ZONE_HEADER_H = 46; // header strip (label + counts / pool grid) per zone
   var ZONE_DIV_GAP = 7; // half-gap around the divider line
-  var ZONE_MIN_FRAC = 0.26; // neither zone shrinks below this fraction
+  var ZONE_MIN_FRAC = 0.26; // neither zone shrinks below this fraction...
   var ZONE_MAX_FRAC = 0.74;
+  // ...but a fraction of a short window is still too small to be usable. At
+  // 26% of a laptop screen the threadpool zone came out shorter than its own
+  // header, so its first row drew on top of the header text. The real floor is
+  // in pixels: a zone must fit its header plus one collapsed row.
+  var ZONE_MIN_PX = 46 /* ZONE_HEADER_H */ + 64 /* ROW_COLLAPSED_H */ + 8;
 
   // Loop-holder honesty (task 4): if the holder produced no in-root event for
   // this many SERVER seconds (playback time), the loop is presumed to be
@@ -96,12 +112,38 @@
 
   var canvas = document.getElementById("viz");
   var ctx = canvas.getContext("2d");
+  // Viewport in CSS px. Everything that lays out or draws uses these, never
+  // VW/height, which are now the DPR-scaled backing store.
+  var VW = 0;
+  var VH = 0;
   var statusEl = document.getElementById("status");
   var statusTextEl = document.getElementById("status-text");
   var eventCountEl = document.getElementById("event-count");
+  var alertsEl = document.getElementById("alerts");
+  var capWarnEl = document.getElementById("cap-warn");
+  var capCountEl = document.getElementById("cap-count");
   var dropWarnEl = document.getElementById("drop-warn");
   var dropCountEl = document.getElementById("drop-count");
   var multiWorkerWarnEl = document.getElementById("multi-worker-warn");
+
+  // The alert strip only occupies space when it has something to say. It sits
+  // OUTSIDE the header for a reason: warnings used to live in the header's
+  // flex row, so raising one shoved every control sideways. Now the canvas
+  // gets a little shorter and the controls do not move at all.
+  function syncAlerts() {
+    if (!alertsEl) return;
+    if (capWarnEl) {
+      capWarnEl.hidden = !hiddenByCap;
+      if (capCountEl) capCountEl.textContent = String(hiddenByCap || 0);
+    }
+    var any =
+      (dropWarnEl && !dropWarnEl.hidden) ||
+      (capWarnEl && !capWarnEl.hidden) ||
+      (multiWorkerWarnEl && !multiWorkerWarnEl.hidden);
+    alertsEl.classList.toggle("on", !!any);
+    // The canvas box changed height, so the backing store has to follow.
+    resize();
+  }
   var workerPidEl = document.getElementById("worker-pid");
 
   var eventCount = 0;
@@ -121,6 +163,7 @@
       droppedCount += seq - lastSeq - 1;
       if (dropCountEl) dropCountEl.textContent = String(droppedCount);
       if (dropWarnEl) dropWarnEl.hidden = false;
+      syncAlerts();
     }
     if (lastSeq === null || seq > lastSeq) lastSeq = seq;
   }
@@ -227,7 +270,7 @@
 
   // --- Request cap / MAX ROWS KEPT -------------------------------------
   // Only up to MAX_REQ requests are KEPT on screen at once (header "max req"
-  // control, default 10 — "max rows kept", since finished rows no longer free
+  // control, default 20 — "max rows kept", since finished rows no longer free
   // themselves on a timer). When a brand-new trace shows up at the cap (see
   // getOrCreateBranch): the OLDEST (lowest seq) branch that is already `done`
   // is evicted to make room. If every kept branch is still live/in-flight,
@@ -237,13 +280,20 @@
   // earlier version added it to a sticky hidden set and dropped it forever,
   // which meant an over-cap request in a simultaneous burst never showed even
   // after the others completed.)
-  var MAX_REQ = 10;
+  var MAX_REQ = 20;
 
   // A trace can block the loop while still OVER the row cap (not yet admitted,
   // so its branch doesn't exist). Remember that here (traceId -> worst
   // blockedMs) so the durable "🔥 blocked" tag is applied when the trace is
   // finally admitted, instead of the blocking fact being lost.
   var blockedBefore = new Map();
+
+  // Requests the row cap turned away, so it can be said out loud.
+  //
+  // A plain counter, not a set: a trace has exactly one request_start, and
+  // that is now the only event that can create a row, so it cannot be
+  // double-counted. Nothing unbounded to grow over a long session.
+  var hiddenByCap = 0;
 
   // --- Slow-motion playback -----------------------------------------
   // Requests finish in milliseconds, so applying events the instant they
@@ -511,7 +561,14 @@
 
       if (ev.kind === "request_start") {
         var b0 = getOrCreateBranch(traceId);
-        if (!b0) continue;
+        if (!b0) {
+          // No room, and nothing finished to evict. This request will not be
+          // shown at all — see the call_enter handler for why that is better
+          // than showing it late — so say how many are being withheld.
+          hiddenByCap++;
+          syncAlerts();
+          continue;
+        }
         b0.method = extra.method || "?";
         b0.path = extra.path || "?";
         b0.rootNode.qualname = b0.method + " " + b0.path;
@@ -548,7 +605,23 @@
       }
 
       if (ev.kind === "call_enter") {
-        var b2 = getOrCreateBranch(traceId);
+        // A row is created ONLY by request_start. This used to create one too,
+        // which is how a request refused at the cap still turned up later:
+        // whichever event arrived after a slot freed built the row, halfway
+        // through the request's life.
+        //
+        // That row was wrong in two ways at once. It appeared to START late,
+        // so fifty requests that ran simultaneously rendered as a staggered
+        // trickle — the exact opposite of what this tool exists to show. And
+        // every call_enter that arrived while it was refused had been dropped,
+        // so its tree was missing frames and the request looked like it did
+        // less work than it did.
+        //
+        // A row is now complete or absent, never partly-invented. The cost:
+        // requests already in flight when the dashboard connects never appear,
+        // because their request_start predates the connection and the
+        // collector does not replay. Open the page first, as the README says.
+        var b2 = branches.get(traceId);
         if (!b2) continue;
         b2.lastEventT = ev.t;
         // One request can span several asyncio tasks (asyncio.create_task
@@ -575,6 +648,13 @@
           state: "running",
           offloaded: false,
           children: [],
+          // Per-call timing. Every ingredient is already in the stream — each
+          // of call_enter / call_exit / suspend / resume carries `ev.t` — so
+          // this costs nothing on the wire.
+          startT: ev.t,
+          endT: null,
+          awaitMs: 0,       // time this frame spent parked at an await
+          _parkedAt: null,  // when the current park began, if it is parked
         };
         b2.nodesById.set(extra.node_id, node);
         parent.children.push(node);
@@ -596,6 +676,14 @@
         var n3 = b3.nodesById.get(extra.node_id);
         if (n3) {
           n3.state = "done";
+          n3.endT = ev.t;
+          // A frame can return straight out of a park (its await resolved and
+          // the coroutine finished); close the open interval or that time is
+          // silently lost from the total.
+          if (n3._parkedAt != null) {
+            n3.awaitMs += Math.max(0, (ev.t - n3._parkedAt) * 1000);
+            n3._parkedAt = null;
+          }
           if (n3.awaiting) n3.awaitDone = true; // frame returned; its await resolved
         }
         var idx = b3.stack.lastIndexOf(extra.node_id);
@@ -613,6 +701,7 @@
           n4.state = "suspended";
           n4.awaiting = extra.awaiting;
           n4.awaitDone = false; // currently blocked on this await
+          if (n4._parkedAt == null) n4._parkedAt = ev.t;
         }
         // Yielding the loop only releases the loop if this trace was the one
         // holding it (it may be releasing a frame deeper than the holder's
@@ -628,6 +717,10 @@
         var n5 = b5.nodesById.get(extra.node_id);
         if (n5) {
           n5.state = "running";
+          if (n5._parkedAt != null) {
+            n5.awaitMs += Math.max(0, (ev.t - n5._parkedAt) * 1000);
+            n5._parkedAt = null;
+          }
           if (n5.awaiting) n5.awaitDone = true; // the await it was blocked on resolved
         }
         // Same per-frame rule as call_enter. `resume` carries no execution
@@ -860,11 +953,23 @@
   // version subtracted the header's height from the viewport, which disagreed
   // with the CSS (a hardcoded one-row header) as soon as the header wrapped —
   // the bitmap and the displayed box drifted apart and everything stretched.
+  // Backing store scaled by devicePixelRatio, drawing surface kept in CSS px.
+  //
+  // The canvas used to be sized 1:1 with its CSS box, so on any retina display
+  // the browser upscaled the whole bitmap — every glyph arrived soft, which is
+  // a good part of why the text read as washed out however light or dark the
+  // colour was. Scaling the backing store and pre-multiplying the context
+  // means all the layout maths below keeps working in CSS pixels unchanged.
+  // Capped at 2: beyond that the memory cost buys nothing visible.
   function resize() {
     var w = canvas.clientWidth || window.innerWidth;
     var h = canvas.clientHeight || window.innerHeight;
-    canvas.width = w;
-    canvas.height = h;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    VW = w;
+    VH = h;
   }
   window.addEventListener("resize", resize);
   resize();
@@ -894,6 +999,65 @@
   var scrollLoop = 0;
   var scrollPool = 0;
   var dividerY = 0;
+
+  // Divider drag. `splitFrac` null = automatic (proportional to row counts,
+  // the old behaviour); a number = the user pinned it there.
+  var splitFrac = null;
+  var dividerDrag = false;
+  var dividerHover = false;
+  var DIVIDER_GRAB = 7; // px either side of the line that counts as a grab
+
+  function overDivider(y) {
+    return Math.abs(y - dividerY) <= DIVIDER_GRAB;
+  }
+
+  // Where the divider may sit, in canvas px. Both zones keep at least
+  // ZONE_MIN_PX unless the window is too short to give it to them, in which
+  // case they split what there is evenly rather than starving one.
+  function clampDividerY(y) {
+    var top = ZONE_TOP;
+    var bottom = VH - ZONE_BOTTOM_MARGIN;
+    var avail = Math.max(40, bottom - top);
+    if (avail < ZONE_MIN_PX * 2) return top + avail / 2;
+    return Math.max(top + ZONE_MIN_PX, Math.min(bottom - ZONE_MIN_PX, y));
+  }
+
+  // Stored as a fraction so a pinned divider keeps its relative position when
+  // the window is resized.
+  function fracFromY(y) {
+    var top = ZONE_TOP;
+    var bottom = VH - ZONE_BOTTOM_MARGIN;
+    var avail = Math.max(40, bottom - top);
+    return (clampDividerY(y) - top) / avail;
+  }
+
+  canvas.addEventListener("pointerdown", function (e) {
+    if (!overDivider(e.offsetY)) return;
+    dividerDrag = true;
+    splitFrac = fracFromY(e.offsetY);
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* older browsers */ }
+    e.preventDefault();
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (dividerDrag) {
+      splitFrac = fracFromY(e.offsetY);
+      e.preventDefault();
+      return;
+    }
+    dividerHover = overDivider(e.offsetY);
+    canvas.style.cursor = dividerHover ? "ns-resize" : "default";
+  });
+  function endDividerDrag() {
+    dividerDrag = false;
+  }
+  canvas.addEventListener("pointerup", endDividerDrag);
+  canvas.addEventListener("pointercancel", endDividerDrag);
+  // Back to automatic. Discoverable because the divider says so while pinned.
+  canvas.addEventListener("dblclick", function (e) {
+    if (!overDivider(e.offsetY)) return;
+    splitFrac = null;
+    e.preventDefault();
+  });
   canvas.addEventListener(
     "wheel",
     function (e) {
@@ -909,6 +1073,8 @@
   var currentRows = [];
 
   // --- Click: select for the inspector + expand/collapse -------------------
+  // (A click that landed on the divider is a drag, not a selection — see the
+  // dividerHover guard inside the handler.)
   // Hit-test: map the click's Y (already screen-space, matching
   // currentRows[i].screenTop/height which had scrollY subtracted in
   // layoutRows) to the row it falls inside. ONE gesture does both: that row
@@ -918,17 +1084,28 @@
   canvas.addEventListener("click", function (e) {
     var r = canvas.getBoundingClientRect();
     var clickY = e.clientY - r.top;
+    // Releasing a divider drag fires a click too; that gesture was a resize,
+    // not a row selection.
+    if (overDivider(clickY)) return;
     for (var i = 0; i < currentRows.length; i++) {
       var row = currentRows[i];
       if (clickY >= row.screenTop && clickY <= row.screenTop + row.height) {
         row.branch.expanded = !row.branch.expanded;
         selectedTrace = row.branch.traceId;
         renderInspector();
+        // Clicking a row is a direct request to see that row, so it always
+        // brings the Request tab forward — even if you had gone back to the
+        // guide. A rule that switches only sometimes is harder to predict
+        // than one that always does.
+        selectTab("request");
         return;
       }
     }
     selectedTrace = null;
     renderInspector();
+    // Nothing selected any more: the request pane would just say "no request",
+    // so hand the panel back to the guide.
+    selectTab("guide");
   });
 
   // --- Request outcome helpers (task 14) ----------------------------------
@@ -946,11 +1123,11 @@
   }
 
   function outcomeColor(b) {
-    if (b.error) return "#f85149";
-    if (b.status != null && b.status >= 500) return "#f85149";
-    if (b.status != null && b.status >= 400) return "#d29922";
-    if (isSlow(b)) return "#d29922";
-    return "#8b949e";
+    if (b.error) return T.bad;
+    if (b.status != null && b.status >= 500) return T.bad;
+    if (b.status != null && b.status >= 400) return T.warn;
+    if (isSlow(b)) return T.warn;
+    return T.dim;
   }
 
   // --- Row filter (task 14) -----------------------------------------------
@@ -958,43 +1135,11 @@
   // `zone:threadpool|pool|loop`. Anything without a `key:` is a plain
   // substring matched against the path and the trace id. Deliberately NOT a
   // query language — keyword/substring only.
-  function parseFilter(text) {
-    var terms = [];
-    var raw = (text || "").trim().toLowerCase().split(/\s+/);
-    for (var i = 0; i < raw.length; i++) {
-      if (!raw[i]) continue;
-      var c = raw[i].indexOf(":");
-      if (c > 0) terms.push({ key: raw[i].slice(0, c), val: raw[i].slice(c + 1) });
-      else terms.push({ key: "", val: raw[i] });
-    }
-    return terms;
-  }
-
-  function matchesTerm(b, t) {
-    switch (t.key) {
-      case "path":
-        return (b.path || "").toLowerCase().indexOf(t.val) >= 0;
-      case "status":
-        return b.status != null && String(b.status) === t.val;
-      case "slow":
-        return t.val === "false" ? !isSlow(b) : isSlow(b);
-      case "zone":
-        return t.val === "loop" ? b.zone === "loop" : b.zone === "pool";
-      case "":
-        return (
-          (b.path || "").toLowerCase().indexOf(t.val) >= 0 ||
-          b.traceId.toLowerCase().indexOf(t.val) >= 0
-        );
-      default:
-        return true; // unknown key: don't silently hide everything
-    }
-  }
-
+  // Filter parsing and matching live in viz/filter.js — pure functions of
+  // (text) and (branch, terms), with no canvas and no shared state.
+  var parseFilter = VIZ.filter.parse;
   function matchesFilter(b) {
-    for (var i = 0; i < filterTerms.length; i++) {
-      if (!matchesTerm(b, filterTerms[i])) return false;
-    }
-    return true;
+    return VIZ.filter.matches(b, filterTerms, isSlow);
   }
 
   // Qualname under the cursor, read from the PREVIOUS frame's hoverRects (see
@@ -1051,7 +1196,7 @@
         var m = expandedMetrics(b);
         metrics.set(b.traceId, m);
         var raw = m.leafCount * SIBLING_GAP + 40; // + padding for labels/margins
-        var maxH = ROW_EXPANDED_MAX_FRAC * canvas.height;
+        var maxH = ROW_EXPANDED_MAX_FRAC * VH;
         h = Math.max(ROW_EXPANDED_MIN, Math.min(maxH, raw));
       } else {
         h = ROW_COLLAPSED_H;
@@ -1120,10 +1265,10 @@
     var trackH = spine.bottom - spine.top;
     var thumbH = Math.max(24, trackH * (trackH / contentHeight));
     var thumbY = trackTop + (scrollVal / maxScroll) * (trackH - thumbH);
-    var x = canvas.width - 6;
-    ctx.fillStyle = "#21262d";
+    var x = VW - 6;
+    ctx.fillStyle = T.track;
     ctx.fillRect(x, trackTop, 4, trackH);
-    ctx.fillStyle = "#484f58";
+    ctx.fillStyle = T.spine;
     ctx.fillRect(x, thumbY, 4, thumbH);
   }
 
@@ -1141,7 +1286,7 @@
     for (var i = 0; i < total; i++) {
       var x = rect.x + i * (cellSize + gap);
       if (x + cellSize > rect.x + rect.w) break; // don't overflow the strip
-      ctx.fillStyle = i < borrowed ? (saturated ? "#f85149" : "#3fb950") : "#21262d";
+      ctx.fillStyle = i < borrowed ? (saturated ? T.bad : T.ok) : T.track;
       ctx.fillRect(x, y, cellSize, cellSize);
     }
   }
@@ -1155,6 +1300,26 @@
   // entirely if the row has scrolled out of view.
   // Header strip at the top of a zone: title + counts (loop) or title + the
   // worker-token grid (pool). Drawn in plain screen space, above the spine.
+  // Offloaded calls we can SEE running, counted from offload_start/offload_end.
+  //
+  // The limiter's own figure is exact when it is taken, but `threadpool.py`
+  // polls it from a task ON THE EVENT LOOP and only pushes a sample when the
+  // numbers change — so while the loop is blocked it cannot sample at all, and
+  // between two samples the header can still be showing the previous value
+  // while rows are visibly running. Step mode freezes that window on screen.
+  //
+  // These events are per-request and cannot be sampled away, so they close the
+  // gap. They are only a LOWER bound though: a request evicted by the row cap
+  // is no longer counted here. Hence max() of the two below — each source can
+  // only ever under-report, so neither can invent a busy worker.
+  function observedLiveWorkers() {
+    var live = 0;
+    branches.forEach(function (b) {
+      if (!b.done && b.liveOffloads > 0) live += b.liveOffloads;
+    });
+    return live;
+  }
+
   function drawZoneHeader(zone, band, list) {
     var liveCount = 0;
     for (var i = 0; i < list.length; i++) if (!list[i].done) liveCount++;
@@ -1162,15 +1327,15 @@
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     var ty = band.top + ZONE_HEADER_H / 2 - 6;
-    ctx.fillStyle = "#e6edf3";
-    ctx.font = "bold 12px monospace";
+    ctx.fillStyle = T.ink;
+    ctx.font = "600 " + T.fs.zone + "px " + MONO;
     if (zone === "loop") {
       ctx.fillText("EVENT LOOP", 12, ty);
-      ctx.font = "10px monospace";
+      ctx.font = T.fs.meta + "px " + MONO;
       if (loopStalled) {
         // Summary lives in the header, which is a dedicated strip. Drawing it
         // over the spine put it on top of the first row's own header.
-        ctx.fillStyle = "#f85149";
+        ctx.fillStyle = T.bad;
         var heldS =
           virtualT !== null ? Math.max(0, virtualT - loopStalled.sinceT) : 0;
         // Name both ends: the app frame you can change, and the deepest frame,
@@ -1183,7 +1348,7 @@
         }
         ctx.fillText(stallLabel, 12, ty + 14);
       } else {
-        ctx.fillStyle = "#8b949e";
+        ctx.fillStyle = T.dim;
         ctx.fillText(
           "1 thread · one runs at a time · " + liveCount + " live · " + list.length + " shown",
           12,
@@ -1192,19 +1357,29 @@
       }
     } else {
       var total = pool.total || POOL_DEFAULT_TOTAL;
-      var borrowed = pool.borrowed || 0;
+      var borrowed = Math.max(pool.borrowed || 0, observedLiveWorkers());
+      var queued = pool.queued || 0;
       var saturated = borrowed >= total && total > 0;
       ctx.fillText("THREADPOOL", 12, ty);
-      ctx.font = "10px monospace";
-      ctx.fillStyle = saturated ? "#f85149" : "#8b949e";
-      ctx.fillText(
-        "worker threads · run in parallel · " + borrowed + "/" + total + " busy",
-        12,
-        ty + 14
-      );
+      ctx.font = T.fs.meta + "px " + MONO;
+      ctx.fillStyle = queued > 0 ? T.warn : saturated ? T.bad : T.dim;
+      // The queue depth is the ONE place the tool can say "waiting FOR a
+      // worker". A row can only ever say "a worker is running my call": the
+      // limiter knows how many calls are waiting for a free thread, but not
+      // which request each belongs to. It comes from the backend on every
+      // pool_sample and had never been displayed.
+      // Same shape as the loop zone's "0 live · 8 shown". Without it, rows on
+      // screen and a busy count of 0 look like a contradiction when in fact
+      // every row is simply finished.
+      var line =
+        "worker threads · run in parallel · " +
+        borrowed + "/" + total + " busy · " +
+        liveCount + " live · " + list.length + " shown";
+      if (queued > 0) line += " · " + queued + " waiting for a free thread";
+      ctx.fillText(line, 12, ty + 14);
       // token grid, right-aligned in the header
-      var gw = Math.min(220, canvas.width * 0.3);
-      drawPoolGrid({ x: canvas.width - gw - 16, y: band.top + 8, w: gw, h: ZONE_HEADER_H - 16 });
+      var gw = Math.min(220, VW * 0.3);
+      drawPoolGrid({ x: VW - gw - 16, y: band.top + 8, w: gw, h: ZONE_HEADER_H - 16 });
     }
     ctx.textBaseline = "alphabetic";
   }
@@ -1215,7 +1390,7 @@
   // so rather than implying this frame is still executing (task 4).
   function drawZoneSpine(zone, spine, rows) {
     ctx.save();
-    ctx.strokeStyle = "#484f58";
+    ctx.strokeStyle = T.spine;
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(spine.x, spine.top);
@@ -1228,8 +1403,8 @@
     // it is stuck right now, say that rather than reporting a past span.
     if (zone === "loop" && loopStalled) {
       ctx.save();
-      ctx.strokeStyle = "#f85149";
-      ctx.shadowColor = "#f85149";
+      ctx.strokeStyle = T.bad;
+      ctx.shadowColor = T.bad;
       ctx.shadowBlur = 14;
       ctx.lineWidth = 5;
       ctx.beginPath();
@@ -1271,13 +1446,13 @@
     var state = branchState(hb);
     if (state === "UNTRACED") {
       ctx.save();
-      ctx.strokeStyle = "#8b949e";
+      ctx.strokeStyle = T.dim;
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.arc(spine.x, y, 6, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.fillStyle = "#8b949e";
-      ctx.font = "9px monospace";
+      ctx.fillStyle = T.dim;
+      ctx.font = T.fs.meta + "px " + MONO;
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
       ctx.fillText("loop: untraced", spine.x + 12, y);
@@ -1296,31 +1471,143 @@
     }
   }
 
+  // The divider, with a grip you can drag.
+  //
+  // It used to be recomputed from row counts every frame and clamped, so there
+  // was no way to give the loop more room when that was the interesting half.
+  // Dragging pins it (`splitFrac`); double-clicking un-pins it and hands it
+  // back to the automatic proportion.
   function drawDivider(y) {
     ctx.save();
-    ctx.strokeStyle = "#30363d";
-    ctx.lineWidth = 1;
+    var live = dividerDrag || dividerHover;
+    ctx.strokeStyle = live ? T.info : T.spine;
+    ctx.lineWidth = live ? 2 : 1.5;
     ctx.beginPath();
     ctx.moveTo(0, y);
-    ctx.lineTo(canvas.width, y);
+    ctx.lineTo(VW, y);
     ctx.stroke();
+
+    var gw = 44, gh = 12, gx = VW / 2 - gw / 2;
+    ctx.beginPath();
+    roundRectPath(gx, y - gh / 2, gw, gh, 6);
+    ctx.fillStyle = live ? T.info : T.panel;
+    ctx.fill();
+    ctx.strokeStyle = live ? T.info : T.spine;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = live ? T.bg : T.dim;
+    for (var i = -1; i <= 1; i++) ctx.fillRect(VW / 2 + i * 7 - 1, y - 3, 2, 6);
+
+    // The hint sits ABOVE the line, and only while the divider is under the
+    // cursor. On the line it was struck through by the line itself; shown
+    // permanently it was a sentence lying across the middle of the graph.
+    if (live && splitFrac !== null) {
+      ctx.font = T.fs.meta + "px " + MONO;
+      ctx.fillStyle = T.dim;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "bottom";
+      ctx.fillText("pinned · double-click for automatic", gx + gw + 12, y - 5);
+      ctx.textBaseline = "alphabetic";
+    }
     ctx.restore();
   }
 
-  function drawIdleHint(filteredOut) {
-    ctx.fillStyle = "#6e7681";
-    ctx.font = "13px monospace";
+  // The empty state.
+  //
+  // Centred on the whole CANVAS it landed exactly on the divider, which struck
+  // a line through the sentence and dropped the drag grip on top of one of its
+  // words. It belongs inside the EVENT LOOP band — that is where rows would
+  // appear — and as a card rather than loose text, so it reads as a deliberate
+  // empty state and stays legible whatever it overlaps.
+  function drawIdleHint(band, filteredOut) {
+    var title = filteredOut ? "No rows match the filter" : "No requests in flight";
+    var hint = filteredOut
+      ? "clear the filter box to see them again"
+      : "send traffic to your app and they appear here";
+
+    ctx.save();
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(
-      filteredOut
-        ? "every request is hidden by the current filter — clear the filter box"
-        : "no in-flight requests — send some traffic to your app to see them here",
-      canvas.width / 2,
-      canvas.height / 2
-    );
+
+    ctx.font = "600 " + (T.fs.zone + 1) + "px " + MONO;
+    var w1 = ctx.measureText(title).width;
+    ctx.font = T.fs.tag + "px " + MONO;
+    var w2 = ctx.measureText(hint).width;
+
+    var padX = 22, padY = 16;
+    var boxW = Math.min(VW - 40, Math.max(w1, w2) + padX * 2);
+    var boxH = 58;
+    // Centred in the GRAPH area — the side panel is an overlay sitting on top
+    // of the canvas, so centring on VW alone would tuck this under it. Its
+    // width is read from the element rather than duplicated as a constant.
+    var reserve = 0;
+    try {
+      var ov = document.getElementById("overlays");
+      if (ov && ov.clientWidth) reserve = ov.clientWidth + 24;
+    } catch (err) {
+      reserve = 0;
+    }
+    var usable = Math.max(boxW + 40, VW - reserve);
+    var cx = usable / 2;
+    // Centre of the BAND, never of the canvas: on the canvas it landed on the
+    // divider and was struck through by it.
+    var cy = (band.top + ZONE_HEADER_H + band.bottom) / 2;
+
+    ctx.beginPath();
+    roundRectPath(cx - boxW / 2, cy - boxH / 2, boxW, boxH, 7);
+    ctx.fillStyle = T.zoneBg;
+    ctx.fill();
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.font = "600 " + (T.fs.zone + 1) + "px " + MONO;
+    ctx.fillStyle = T.dim;
+    ctx.fillText(title, cx, cy - 10);
+    ctx.font = T.fs.tag + "px " + MONO;
+    ctx.fillStyle = T.faint;
+    ctx.fillText(hint, cx, cy + 11);
+
+    ctx.restore();
     ctx.textAlign = "left";
     ctx.textBaseline = "alphabetic";
+  }
+
+  // How long one call took, and — where it can be proved — how much of that
+  // it actually occupied a thread for.
+  //
+  // The proof matters. `sys.monitoring` emits suspend/resume for the frame
+  // that ACTUALLY yields, never for its callers: when `db_fetch` parks at an
+  // await for 200ms, its parents `get_user` and the endpoint record no park at
+  // all. So `elapsed - awaitMs` is only the truth for a LEAF frame. Applied to
+  // a parent it counts every millisecond its children spent parked as loop
+  // occupancy — measured on a real capture, an endpoint that held the loop for
+  // 80ms was reported as holding it for 282.
+  //
+  // Which is the exact error this tool exists to correct, so a frame with
+  // children gets no such claim: plain elapsed, and the children below it say
+  // where the time actually went.
+  function nodeTiming(node) {
+    if (node.startT == null) return null;
+    var end = node.endT != null ? node.endT : virtualT;
+    if (end == null) return null;
+    var ms = Math.max(0, (end - node.startT) * 1000);
+    // Still running: a number that keeps climbing beats nothing, but say so.
+    var suffix = node.endT == null ? "…" : "";
+
+    if (node.children && node.children.length) return fmtMs(ms) + suffix;
+
+    if (node.execution === "threadpool") return fmtMs(ms) + suffix + " on worker";
+    if (node.awaitMs >= 5) {
+      return fmtMs(ms) + suffix + " · " + fmtMs(Math.max(0, ms - node.awaitMs)) + " on loop";
+    }
+    return fmtMs(ms) + suffix + " on loop";
+  }
+
+  function fmtMs(ms) {
+    if (ms >= 1000) return (ms / 1000).toFixed(2) + "s";
+    return Math.round(ms) + "ms";
   }
 
   function truncate(s, n) {
@@ -1328,33 +1615,32 @@
     return s.length > n ? s.slice(0, n - 1) + "…" : s;
   }
 
-  function drawEdge(x0, y0, x1, y1, color, alpha, dashed, width) {
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width || 1.5;
-    if (dashed) ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
-    ctx.stroke();
-    ctx.restore();
-  }
+  // Drawing primitives, bound to this canvas once (see viz/primitives.js).
+  // Bound rather than passed a ctx at every call, so the ~20 call sites below
+  // read exactly as they did before the split.
+  var P = VIZ.primitives(ctx, T, NODE_W, NODE_H);
+  var roundRectPath = P.roundRectPath;
+  var drawChip = P.drawChip;
+  var drawEdge = P.drawEdge;
+  var drawNodeEdge = P.drawNodeEdge;
+  var clipToBox = VIZ.geometry.clipToBox;
 
   // Draw one node box plus edges to its children, recursively.
-  function drawNode(node, x, y, w, h, scale, alpha, hue, activeId, pRect) {
+  function drawNode(node, x, y, w, h, scale, alpha, hue, activeId, pRect, detail) {
     var isActive = node.id === activeId;
-    var fill, borderColor;
-    if (node.state === "suspended") {
-      fill = "hsl(" + hue + ", 30%, 24%)";
-      borderColor = "hsl(" + hue + ", 30%, 40%)";
-    } else if (node.state === "done") {
-      fill = "hsl(" + hue + ", 15%, 16%)";
-      borderColor = "#30363d";
-    } else {
-      fill = "hsl(" + hue + ", 70%, 42%)";
-      borderColor = "hsl(" + hue + ", 80%, 65%)";
-    }
+
+    // Direction B: the body stays dark whatever the state, and the state is
+    // carried by a 4px left stripe. The old palette flooded the box with a
+    // saturated hue and put white text on top of it, which is where most of
+    // the illegibility came from — the label's contrast changed with the hue
+    // and the state, and at 11px there was nothing left to read.
+    var fill = node.state === "done" ? T.nodeBodyDone : T.nodeBody;
+    var borderColor = node.state === "done" ? T.nodeBorderDone : T.nodeBorder;
+    var stripeColor = node.blocking || node.wasBlocking ? T.bad
+                    : node.state === "done" ? T.nodeBorderDone
+                    : node.offloaded ? T.worker
+                    : node.state === "suspended" ? T.info
+                    : "hsl(" + hue + ", 70%, 58%)";
 
     ctx.save();
     ctx.globalAlpha = alpha;
@@ -1366,7 +1652,9 @@
       ctx.shadowBlur = 14;
       ctx.lineWidth = 2.5;
       ctx.strokeStyle = "hsl(" + hue + ", 90%, 70%)";
-      ctx.strokeRect(x - w / 2 - 3, y - h / 2 - 3, w + 6, h + 6);
+      ctx.beginPath();
+      roundRectPath(x - w / 2 - 3, y - h / 2 - 3, w + 6, h + 6, T.radius + 2);
+      ctx.stroke();
       ctx.restore();
     }
 
@@ -1385,17 +1673,21 @@
       ctx.save();
       ctx.globalAlpha = alpha;
       ctx.lineWidth = 2;
-      ctx.strokeStyle = "#f85149";
-      ctx.strokeRect(x - w / 2 - 2, y - h / 2 - 2, w + 4, h + 4);
+      ctx.strokeStyle = T.bad;
+      ctx.beginPath();
+      roundRectPath(x - w / 2 - 2, y - h / 2 - 2, w + 4, h + 4, T.radius + 2);
+      ctx.stroke();
       ctx.restore();
     }
     if (node.blocking) {
       ctx.save();
-      ctx.shadowColor = "#f85149";
+      ctx.shadowColor = T.bad;
       ctx.shadowBlur = 18;
       ctx.lineWidth = 3;
-      ctx.strokeStyle = "#ff6a5f";
-      ctx.strokeRect(x - w / 2 - 3, y - h / 2 - 3, w + 6, h + 6);
+      ctx.strokeStyle = T.badHot;
+      ctx.beginPath();
+      roundRectPath(x - w / 2 - 3, y - h / 2 - 3, w + 6, h + 6, T.radius + 2);
+      ctx.stroke();
       ctx.restore();
     }
 
@@ -1409,35 +1701,59 @@
       ctx.globalAlpha = alpha;
       ctx.setLineDash([3, 3]);
       ctx.lineWidth = 1.5;
-      ctx.strokeStyle = "#79c0ff";
-      ctx.strokeRect(x - w / 2 - 5, y - h / 2 - 5, w + 10, h + 10);
+      ctx.strokeStyle = T.hover;
+      ctx.beginPath();
+      roundRectPath(x - w / 2 - 5, y - h / 2 - 5, w + 10, h + 10, T.radius + 3);
+      ctx.stroke();
       ctx.restore();
     }
 
+    var bx = x - w / 2, by = y - h / 2, r = T.radius;
+    ctx.beginPath();
+    roundRectPath(bx, by, w, h, r);
     ctx.fillStyle = fill;
+    ctx.fill();
     ctx.strokeStyle = borderColor;
     ctx.lineWidth = node.isRoot ? 2 : 1;
-    ctx.fillRect(x - w / 2, y - h / 2, w, h);
-    ctx.strokeRect(x - w / 2, y - h / 2, w, h);
+    ctx.stroke();
 
-    ctx.fillStyle = node.state === "done" ? "#6e7681" : "#e6edf3";
-    ctx.font = Math.max(9, Math.round(11 * scale)) + "px monospace";
+    // The state stripe, clipped to the body so it keeps the rounded corner.
+    var sw = Math.max(2, T.stripe * Math.min(1, scale + 0.35));
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(bx, by, w, h, r);
+    ctx.clip();
+    ctx.fillStyle = stripeColor;
+    ctx.fillRect(bx, by, sw, h);
+    ctx.restore();
+
+    ctx.fillStyle = node.state === "done" ? T.dim : T.ink;
+    ctx.font = Math.max(10, Math.round(T.fs.node * scale)) + "px " + MONO;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    var label = truncate(node.qualname, Math.floor(18 / Math.max(scale, 0.5)));
-    ctx.fillText(label, x, y);
+    var label = truncate(node.qualname, Math.floor(17 / Math.max(scale, 0.5)));
+    ctx.fillText(label, x + sw / 2, y);
 
     if (node.state === "suspended") {
-      ctx.font = Math.max(9, Math.round(10 * scale)) + "px monospace";
-      ctx.fillText("⏸", x + w / 2 - 10 * scale, y - h / 2 + 9 * scale);
+      // Two bars rather than the ⏸ emoji: at this size the emoji rendered
+      // differently on every OS and read as a smudge on a dark ground.
+      ctx.fillStyle = T.info;
+      var px = x + w / 2 - 11 * scale, py = y - h / 2 + 4 * scale;
+      var bw = Math.max(1.5, 2.2 * scale), bh = Math.max(5, 8 * scale);
+      ctx.fillRect(px, py, bw, bh);
+      ctx.fillRect(px + bw + 2 * scale, py, bw, bh);
     }
-    // Finished request: green "✓ finished" tag under the request-root node.
-    if (node.isRoot && node.state === "done") {
-      ctx.fillStyle = "#3fb950";
-      ctx.font = "bold " + Math.max(9, Math.round(10 * scale)) + "px monospace";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      ctx.fillText("✓ finished", x, y + h / 2 + 3);
+    // Per-call timing, expanded rows only — it would not fit on a collapsed
+    // one and the row header already gives the request total there.
+    if (detail && scale > 0.5) {
+      var timing = nodeTiming(node);
+      if (timing) {
+        ctx.font = Math.max(9, Math.round((T.fs.meta - 1) * scale)) + "px " + MONO;
+        ctx.fillStyle = node.state === "done" ? T.faint : T.dim;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.fillText(timing, x + sw / 2, y + h / 2 + 4);
+      }
     }
     ctx.textAlign = "left";
     ctx.textBaseline = "alphabetic";
@@ -1465,11 +1781,11 @@
       var sx = x + w / 2;
       var sy = y;
       var stub = 26 * scale;
-      drawEdge(sx, sy, sx + stub, sy, "hsl(30, 90%, 60%)", alpha * 0.9, true, 1.5);
+      drawEdge(sx, sy, sx + stub, sy, T.worker, alpha * 0.9, true, 1.5, true);
       ctx.save();
       ctx.globalAlpha = alpha;
       ctx.fillStyle = "hsl(30, 90%, 62%)";
-      ctx.font = Math.max(8, Math.round(9 * scale)) + "px monospace";
+      ctx.font = Math.max(9, Math.round(T.fs.meta * scale)) + "px " + MONO;
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
       ctx.fillText("⇢ pool", sx + stub + 3, sy);
@@ -1487,8 +1803,8 @@
   // though the whole row is also a click target.
   function drawExpandArrow(rootX, rootY, scale, isExpanded) {
     ctx.save();
-    ctx.fillStyle = "#8b949e";
-    ctx.font = Math.max(9, Math.round(11 * scale)) + "px monospace";
+    ctx.fillStyle = T.dim;
+    ctx.font = Math.max(10, Math.round(T.fs.node * scale)) + "px " + MONO;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(isExpanded ? "▾" : "▸", rootX - (NODE_W * scale) / 2 - 10, rootY);
@@ -1499,8 +1815,8 @@
   function drawBadge(x, y, n, alpha) {
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.font = "10px monospace";
-    ctx.fillStyle = "#8b949e";
+    ctx.font = T.fs.meta + "px " + MONO;
+    ctx.fillStyle = T.dim;
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.fillText("[+" + n + "]", x, y);
@@ -1522,12 +1838,12 @@
   // Small "#id" tag above a request's root node so each concurrent request is
   // identifiable by its short random id (from the backend trace_id).
   var STATE_STYLE = {
-    RUNNING: { glyph: "●", color: "#3fb950", label: "RUNNING" },
-    WAITING: { glyph: "○", color: "#8b949e", label: "WAITING" },
-    UNTRACED: { glyph: "⋯", color: "#d29922", label: "UNTRACED" },
-    WORKER: { glyph: "⇢", color: "#f0883e", label: "WAITING · worker" },
-    STALLED: { glyph: "⏱", color: "#f85149", label: "STALLED" },
-    DONE: { glyph: "✓", color: "#6e7681", label: "DONE" },
+    RUNNING: { glyph: "●", color: T.ok, label: "RUNNING" },
+    WAITING: { glyph: "○", color: T.dim, label: "WAITING" },
+    UNTRACED: { glyph: "⋯", color: T.warn, label: "UNTRACED" },
+    WORKER: { glyph: "⇢", color: T.worker, label: "WAITING · worker" },
+    STALLED: { glyph: "⏱", color: T.bad, label: "STALLED" },
+    DONE: { glyph: "✓", color: T.faint, label: "DONE" },
   };
 
   function drawRowHeader(b, state, rowY) {
@@ -1539,47 +1855,47 @@
 
     // Gutter mark on the row the inspector is currently describing.
     if (selectedTrace === b.traceId) {
-      ctx.font = "bold 11px monospace";
-      ctx.fillStyle = "#58a6ff";
+      ctx.font = "600 " + T.fs.tag + "px " + MONO;
+      ctx.fillStyle = T.info;
       ctx.fillText("▍", x - 9, y);
     }
 
     // Short id only — trace ids are 16 hex chars now; the full one is in the
     // inspector.
-    ctx.font = "bold 11px monospace";
+    ctx.font = "600 " + T.fs.tag + "px " + MONO;
     ctx.fillStyle = "hsl(" + b.hue + ", 60%, 72%)";
     var idText = "#" + b.shortId;
     ctx.fillText(idText, x, y);
     x += ctx.measureText(idText).width + 10;
 
+    // Chips from here on. A tinted ground is what makes a glyph findable at
+    // this size on a near-black canvas, and it groups each tag's glyph with
+    // its label instead of leaving them as loose text on the row.
     var st = STATE_STYLE[state] || STATE_STYLE.WAITING;
-    ctx.font = "10px monospace";
-    ctx.fillStyle = st.color;
-    var stateText = st.glyph + " " + st.label;
-    ctx.fillText(stateText, x, y);
-    x += ctx.measureText(stateText).width + 12;
+    x += drawChip(x, y - T.fs.tag / 2, st.glyph + " " + st.label, st.color) + 7;
 
     // Outcome tag (task 14): "200 · 42ms", amber past the slow threshold, red
     // for 5xx or a raised exception — so a bad or slow request reads without
     // opening the inspector.
     var outcome = outcomeText(b);
     if (outcome) {
-      ctx.fillStyle = outcomeColor(b);
-      ctx.fillText(outcome, x, y);
-      x += ctx.measureText(outcome).width + 12;
+      x += drawChip(x, y - T.fs.tag / 2, outcome, outcomeColor(b)) + 7;
     }
 
     // Durable "⇢ pool" tag: this request handed work to a worker thread at
     // some point. The row never moves zones, and the pool-zone entry only
     // exists while the call runs — so without this a finished request shows
     // no sign it used a worker at all.
-    if (b.offloadCount) {
-      ctx.fillStyle = "hsl(30, 90%, 62%)";
+    // Only in the LOOP zone. In the THREADPOOL zone the whole row already
+    // means "this ran on a worker", so the chip restates the row's own zone —
+    // and reads as a second, smaller number competing with the request total.
+    // The per-node "⇢ pool" stub is suppressed there for the same reason
+    // (see poolZoneDraw); this chip was the one marker that had been missed.
+    if (b.offloadCount && b.zone !== "pool") {
       var ptag = "⇢ pool";
       if (b.offloadCount > 1) ptag += " ×" + b.offloadCount;
       if (b.offloadMs) ptag += " " + b.offloadMs + "ms";
-      ctx.fillText(ptag, x, y);
-      x += ctx.measureText(ptag).width + 12;
+      x += drawChip(x, y - T.fs.tag / 2, ptag, T.worker) + 7;
     }
 
     // The verdict, split into its two genuinely different kinds.
@@ -1596,7 +1912,7 @@
     //      the UNTRACED state: never look more certain than the instrumentation
     //      actually is.
     if (b.ioCalls.size) {
-      ctx.fillStyle = "#f85149";
+      ctx.fillStyle = T.bad;
       var kinds = [];
       b.ioCalls.forEach(function (c) {
         kinds.push(c);
@@ -1607,13 +1923,12 @@
       var iotag = "🔥 blocking I/O: " + kinds.sort().join(", ");
       if (b.blockedMs) iotag += " " + (b.blockedMs / 1000).toFixed(2) + "s";
       if (b.blockCount > 1) iotag += " ×" + b.blockCount;
-      ctx.fillText(iotag, x, y);
+      drawChip(x, y - T.fs.tag / 2, iotag, T.bad);
     } else if (b.blocked) {
-      ctx.fillStyle = "#d29922";
       var cputag = "⚙ held the loop";
       if (b.blockedMs) cputag += " " + (b.blockedMs / 1000).toFixed(2) + "s";
       if (b.blockCount > 1) cputag += " ×" + b.blockCount;
-      ctx.fillText(cputag, x, y);
+      drawChip(x, y - T.fs.tag / 2, cputag, T.warn);
     }
 
     ctx.textBaseline = "alphabetic";
@@ -1684,7 +1999,7 @@
 
   function drawBranchCollapsed(b, spine, rowY, alpha, activeId, holds) {
     var shape = collapsedShape(b);
-    var availW = canvas.width - ROOT_X - MARGIN;
+    var availW = VW - ROOT_X - MARGIN;
     var scaleX =
       shape.maxDepth > 0 ? Math.min(1, availW / (shape.maxDepth * NODE_SPACING_X)) : 1;
     var scale = Math.max(MIN_SCALE, scaleX);
@@ -1709,15 +2024,17 @@
       if (p.x > rightmost) rightmost = p.x;
 
       if (node.isRoot) {
+        var rootEnd = clipToBox(spine.x, rowY, p.x, p.y, p.x, p.y, NODE_W / 2, NODE_H / 2);
         drawEdge(
           spine.x,
           rowY,
-          p.x,
-          p.y,
+          rootEnd.x,
+          rootEnd.y,
           holds ? "hsl(" + b.hue + ", 90%, 65%)" : edgeColor,
           alpha * (holds ? 1 : 0.45),
           !holds,
-          holds ? 2.5 : 1.5
+          holds ? 2.5 : 1.5,
+          true
         );
       } else {
         var parentPos =
@@ -1730,7 +2047,7 @@
           edgeAlpha = alpha * 0.3;
           dashed = true;
         }
-        drawEdge(parentPos.x, parentPos.y, p.x, p.y, edgeColor, edgeAlpha, dashed, 1.5);
+        drawNodeEdge(parentPos.x, parentPos.y, p.x, p.y, edgeColor, edgeAlpha, dashed);
       }
 
       drawNode(node, p.x, p.y, NODE_W * scale, NODE_H * scale, scale, alpha, b.hue, activeId, null);
@@ -1764,7 +2081,7 @@
     var leafCount = metrics.leafCount;
     var maxDepth = metrics.maxDepth;
 
-    var availW = canvas.width - ROOT_X - MARGIN;
+    var availW = VW - ROOT_X - MARGIN;
     var scaleX = maxDepth > 0 ? Math.min(1, availW / (maxDepth * NODE_SPACING_X)) : 1;
     var neededH = leafCount * SIBLING_GAP;
     var scaleY = Math.min(1, (rowHeight * ROW_BAND_FILL) / Math.max(1, neededH));
@@ -1788,15 +2105,17 @@
       if (node.isRoot) {
         // Connector from the request root to the spine: bright + thick while
         // this row is running, faint + dashed while it's parked.
+        var rootEnd = clipToBox(spine.x, rowY, p.x, p.y, p.x, p.y, NODE_W / 2, NODE_H / 2);
         drawEdge(
           spine.x,
           rowY,
-          p.x,
-          p.y,
+          rootEnd.x,
+          rootEnd.y,
           holds ? "hsl(" + b.hue + ", 90%, 65%)" : edgeColor,
           alpha * (holds ? 1 : 0.45),
           !holds,
-          holds ? 2.5 : 1.5
+          holds ? 2.5 : 1.5,
+          true
         );
         rootPos = p;
       } else if (parentPos) {
@@ -1805,7 +2124,7 @@
           edgeAlpha = alpha * 0.3;
           dashed = true;
         }
-        drawEdge(parentPos.x, parentPos.y, p.x, p.y, edgeColor, edgeAlpha, dashed, 1.5);
+        drawNodeEdge(parentPos.x, parentPos.y, p.x, p.y, edgeColor, edgeAlpha, dashed);
       }
 
       drawNode(
@@ -1818,7 +2137,8 @@
         alpha,
         b.hue,
         activeId,
-        null
+        null,
+        true // expanded: per-call timing under each box
       );
 
       for (var i = 0; i < node.children.length; i++) {
@@ -1839,7 +2159,7 @@
     var h = NODE_H;
     var x = ROOT_X;
 
-    drawEdge(spine.x, rowY, x - w / 2, rowY, "hsl(30, 90%, 60%)", 0.9, true, 1.5);
+    drawEdge(spine.x, rowY, x - w / 2, rowY, T.worker, 0.9, true, 1.5, true);
 
     ctx.save();
     ctx.fillStyle = "hsl(" + item.hue + ", 55%, 26%)";
@@ -1847,8 +2167,8 @@
     ctx.lineWidth = 1.5;
     ctx.fillRect(x - w / 2, rowY - h / 2, w, h);
     ctx.strokeRect(x - w / 2, rowY - h / 2, w, h);
-    ctx.fillStyle = "#e6edf3";
-    ctx.font = "11px monospace";
+    ctx.fillStyle = T.ink;
+    ctx.font = T.fs.tag + "px " + MONO;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(truncate(item.qualname, 18), x, rowY);
@@ -1858,12 +2178,12 @@
     ctx.textAlign = "left";
     ctx.textBaseline = "bottom";
     var ty = rowY - h / 2 - 4;
-    ctx.font = "bold 11px monospace";
+    ctx.font = "600 " + T.fs.tag + "px " + MONO;
     ctx.fillStyle = "hsl(" + item.hue + ", 60%, 72%)";
     var idText = "#" + item.shortId;
     ctx.fillText(idText, x - w / 2, ty);
-    ctx.font = "10px monospace";
-    ctx.fillStyle = "#f0883e";
+    ctx.font = T.fs.meta + "px " + MONO;
+    ctx.fillStyle = T.worker;
     var elapsed =
       virtualT !== null ? Math.max(0, Math.round((virtualT - item.startT) * 1000)) : 0;
     ctx.fillText(
@@ -1894,7 +2214,7 @@
         var lines = [r.qualname];
         if (r.file) lines.push(r.file + ":" + (r.line || "?"));
         if (r.awaiting) lines.push((r.awaitDone ? "await complete: " : "awaiting ") + r.awaiting);
-        ctx.font = "11px monospace";
+        ctx.font = T.fs.tag + "px " + MONO;
         var w = Math.max.apply(
           null,
           lines.map(function (l) {
@@ -1902,13 +2222,13 @@
           })
         ) + 12;
         var h = lines.length * 14 + 8;
-        var tx = Math.min(mouseX + 12, canvas.width - w - 4);
-        var ty = Math.min(mouseY + 12, canvas.height - h - 4);
-        ctx.fillStyle = "#161b22";
-        ctx.strokeStyle = "#30363d";
+        var tx = Math.min(mouseX + 12, VW - w - 4);
+        var ty = Math.min(mouseY + 12, VH - h - 4);
+        ctx.fillStyle = T.panel;
+        ctx.strokeStyle = T.line;
         ctx.fillRect(tx, ty, w, h);
         ctx.strokeRect(tx, ty, w, h);
-        ctx.fillStyle = "#e6edf3";
+        ctx.fillStyle = T.ink;
         ctx.textBaseline = "top";
         for (var l = 0; l < lines.length; l++) {
           ctx.fillText(lines[l], tx + 6, ty + 4 + l * 14);
@@ -1924,7 +2244,10 @@
   // shared click/hover hit-test) and the clamped scroll offset.
   function drawZone(zone, band, list, scrollVal, work) {
     var spineTop = band.top + ZONE_HEADER_H;
-    var spineBottom = Math.max(spineTop + 20, band.bottom);
+    // Never past the band. Forcing a minimum height here pushed the row area
+    // beyond the zone it belongs to whenever the band was short, which is how
+    // rows ended up drawn over the next zone's header.
+    var spineBottom = Math.max(spineTop, band.bottom);
     var bandRowsH = spineBottom - spineTop;
 
     var layout = layoutRowList(list);
@@ -1962,7 +2285,7 @@
 
     ctx.save();
     ctx.beginPath();
-    ctx.rect(0, spineTop - 2, canvas.width, bandRowsH + 4);
+    ctx.rect(0, spineTop - 2, VW, bandRowsH + 4);
     ctx.clip();
     poolZoneDraw = zone === "pool";
     for (var j = 0; j < layout.rows.length; j++) {
@@ -2026,8 +2349,8 @@
     // cleared below — drawNode needs it while drawing THIS frame.
     hoverQual = qualnameAt(mouseX, mouseY);
 
-    ctx.fillStyle = "#0d1117";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = T.bg;
+    ctx.fillRect(0, 0, VW, VH);
     hoverRects = [];
 
     // Split kept branches into the two zones (see b.zone, set in ingest()),
@@ -2056,12 +2379,15 @@
     // Divider sits proportionally to each zone's row count, clamped so both
     // headers always show.
     var top = ZONE_TOP;
-    var bottom = canvas.height - ZONE_BOTTOM_MARGIN;
+    var bottom = VH - ZONE_BOTTOM_MARGIN;
     var avail = Math.max(40, bottom - top);
     var n = loopList.length + poolList.length + poolWork.length;
     var frac = n === 0 ? 0.5 : loopList.length / n;
     frac = Math.max(ZONE_MIN_FRAC, Math.min(ZONE_MAX_FRAC, frac));
-    dividerY = top + frac * avail;
+    // A pinned divider wins over the automatic proportion — but neither may
+    // squeeze a zone below its pixel floor.
+    if (splitFrac !== null) frac = splitFrac;
+    dividerY = clampDividerY(top + frac * avail);
 
     var loopBand = { top: top, bottom: dividerY - ZONE_DIV_GAP };
     var poolBand = { top: dividerY + ZONE_DIV_GAP, bottom: bottom };
@@ -2081,7 +2407,7 @@
     }
 
     if (loopList.length === 0 && poolList.length === 0 && poolWork.length === 0) {
-      drawIdleHint(branches.size > 0);
+      drawIdleHint(loopBand, branches.size > 0);
     }
 
     drawTooltip();
@@ -2127,6 +2453,7 @@
             var meta = frame.meta;
             if (meta && meta.multi_worker) {
               if (multiWorkerWarnEl) multiWorkerWarnEl.hidden = false;
+              syncAlerts();
               if (workerPidEl) workerPidEl.textContent = String(meta.worker_pid || "?");
             }
           } catch (e) { /* ignore */ }
@@ -2170,7 +2497,7 @@
   // longer free themselves — see the eviction logic in getOrCreateBranch()).
   var maxReqInput = document.getElementById("ld-maxreq");
   function applyMaxReq() {
-    MAX_REQ = Math.max(1, Math.min(50, parseInt(maxReqInput.value, 10) || 10));
+    MAX_REQ = Math.max(1, Math.min(50, parseInt(maxReqInput.value, 10) || 20));
   }
   if (maxReqInput) {
     maxReqInput.addEventListener("input", applyMaxReq);
@@ -2188,6 +2515,8 @@
       branches.clear();
       nextSeq = 0;
       blockedBefore.clear();
+      hiddenByCap = 0;
+      syncAlerts();
       pending = [];
       loopHolder = null;
       loopStalled = null;
@@ -2197,6 +2526,7 @@
       droppedCount = 0;
       if (dropCountEl) dropCountEl.textContent = "0";
       if (dropWarnEl) dropWarnEl.hidden = true;
+      syncAlerts();
       renderInspector();
     });
   }
@@ -2248,11 +2578,30 @@
   // (that's the whole point of showing it), and this keeps the canvas draw
   // path from growing another responsibility. Repainted on selection change
   // and at most every 200ms while the selected request is still running.
-  var inspectorEl = document.getElementById("inspector");
+  var panelEl = document.getElementById("panel");
   var inspectorBody = document.getElementById("inspector-body");
-  var inspectorTitle = document.getElementById("inspector-title");
-  var inspectorToggle = document.getElementById("inspector-toggle");
-  var inspectorHead = document.getElementById("inspector-head");
+  var requestEmpty = document.getElementById("request-empty");
+  var tabGuide = document.getElementById("tab-guide");
+  var tabRequest = document.getElementById("tab-request");
+  var paneGuide = document.getElementById("pane-guide");
+  var paneRequest = document.getElementById("pane-request");
+  var panelCollapse = document.getElementById("panel-collapse");
+
+  // The guide is the DEFAULT tab, not the request detail.
+  //
+  // Two stacked panels became one with two tabs, and the obvious default was
+  // the request pane — except it is empty until you click something, so a
+  // first run greeted you with nothing at all. Leading with the guide means
+  // the panel always has something in it and teaches before it is asked.
+  function selectTab(which) {
+    var guide = which !== "request";
+    if (tabGuide) tabGuide.setAttribute("aria-selected", String(guide));
+    if (tabRequest) tabRequest.setAttribute("aria-selected", String(!guide));
+    if (paneGuide) paneGuide.hidden = !guide;
+    if (paneRequest) paneRequest.hidden = guide;
+  }
+  if (tabGuide) tabGuide.addEventListener("click", function () { selectTab("guide"); });
+  if (tabRequest) tabRequest.addEventListener("click", function () { selectTab("request"); });
 
   function esc(v) {
     return String(v == null ? "" : v).replace(/[&<>]/g, function (c) {
@@ -2271,19 +2620,22 @@
   }
 
   function renderInspector() {
-    if (!inspectorEl || !inspectorBody) return;
+    if (!inspectorBody) return;
     lastInspectorPaint = performance.now();
     var b = selectedTrace ? branches.get(selectedTrace) : null;
     if (!b) {
-      inspectorEl.hidden = true;
+      // Nothing selected: the pane says so rather than vanishing, because the
+      // tab is still there and an empty box with no explanation is worse.
+      inspectorBody.innerHTML = "";
+      if (requestEmpty) requestEmpty.hidden = false;
       return;
     }
-    inspectorEl.hidden = false;
-    if (inspectorTitle) {
-      inspectorTitle.textContent = "#" + b.shortId + "  " + b.method + " " + b.path;
-    }
+    if (requestEmpty) requestEmpty.hidden = true;
 
-    var html = "";
+    var html = irow(
+      "request",
+      '<b style="color:#f4f7fb">' + esc(b.method + " " + b.path) + "</b>"
+    );
     html += irow("state", esc(branchState(b)));
     html += irow(
       "status",
@@ -2303,6 +2655,23 @@
       "zone",
       b.zone === "pool" ? "threadpool (worker thread)" : "event loop"
     );
+    // For a sync endpoint the row total and the worker time are different
+    // numbers, and the gap is the interesting one: time the request existed
+    // without any thread working on it. We can measure the gap but not
+    // attribute it — queueing for a free worker, ASGI overhead and a loop
+    // frozen by someone else all land here — so it is named for what it
+    // provably is and no cause is claimed.
+    if (b.zone === "pool" && b.offloadMs && b.durationMs != null) {
+      var offRow = Math.max(0, b.durationMs - b.offloadMs);
+      html += irow("on a worker", esc(b.offloadMs) + "ms");
+      if (offRow >= 5) {
+        html += irow(
+          "not on a worker",
+          '<span class="warn">' + esc(offRow) + "ms</span> — queued for a thread, " +
+            "framework overhead, or the loop was busy elsewhere"
+        );
+      }
+    }
     html += irow("trace id", '<span class="sel">' + esc(b.traceId) + "</span>");
     if (b.requestId) {
       html += irow("x-request-id", '<span class="sel">' + esc(b.requestId) + "</span>");
@@ -2363,24 +2732,50 @@
     inspectorBody.innerHTML = html;
   }
 
-  function toggleInspector(e) {
-    if (!inspectorEl) return;
-    if (e) e.stopPropagation();
-    var min = inspectorEl.classList.toggle("min");
-    if (inspectorToggle) inspectorToggle.textContent = min ? "+" : "–";
+  if (panelCollapse) {
+    panelCollapse.addEventListener("click", function () {
+      var min = panelEl.classList.toggle("min");
+      panelCollapse.textContent = min ? "+" : "–";
+      panelCollapse.setAttribute("aria-label", min ? "expand panel" : "minimize panel");
+    });
   }
-  if (inspectorHead) inspectorHead.addEventListener("click", toggleInspector);
+  selectTab("guide");
   renderInspector();
+  // Assert the strip's starting state rather than relying on the `hidden`
+  // attributes in the markup staying in step with this file.
+  syncAlerts();
 
-  // Intern helper panel: minimize/expand by toggling the .min class; clicking
-  // anywhere on its header bar toggles too (the whole bar is the hit target).
-  var legendEl = document.getElementById("legend");
-  var legendHead = document.getElementById("legend-head");
-  var legendToggle = document.getElementById("legend-toggle");
-  function toggleLegend() {
-    if (!legendEl) return;
-    var min = legendEl.classList.toggle("min");
-    if (legendToggle) legendToggle.textContent = min ? "+" : "–";
-  }
-  if (legendHead) legendHead.addEventListener("click", toggleLegend);
+  // --- Keyboard ------------------------------------------------------------
+  // Two keys, both earning their place by being something you do more than
+  // once in a session. Stepping was the worst of it: every single step meant
+  // moving the mouse back up to the header.
+  document.addEventListener("keydown", function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    var el = document.activeElement;
+    var typing =
+      el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+
+    if (e.key === "/" && !typing) {
+      if (filterInput) {
+        e.preventDefault();
+        filterInput.focus();
+        filterInput.select();
+      }
+      return;
+    }
+    if (e.key === "Escape" && typing && el === filterInput) {
+      // Out of the filter without reaching for the mouse.
+      filterInput.blur();
+      return;
+    }
+    // Space steps — but never while a field has focus, or typing a space into
+    // a filter term would silently advance the playback instead.
+    if ((e.key === " " || e.key === "Spacebar") && !typing) {
+      if (stepMode && stepBtn && !stepBtn.disabled) {
+        e.preventDefault();
+        doStep();
+        render();
+      }
+    }
+  });
 })();
