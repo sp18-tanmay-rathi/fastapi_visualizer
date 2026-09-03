@@ -440,5 +440,68 @@ check("the empty state explains a filter that hides everything", () => {
     throw new Error("a filter hiding every row should say so: " + h.drawn().join(" | "));
 });
 
+// --- node labels must stay distinguishable --------------------------------
+//
+// Found on a real Django/DRF project: labels truncated to 17 chars from the
+// LEFT, and Python puts the identifying part of a qualname LAST. Three
+// distinct frames rendered as two identical labels, so the graph looked like
+// the view's class name repeated.
+
+function drfTree(h) {
+  h.frame([
+    ev(T0, "request_start", { method: "GET", path: "/api/wallets/all-async/", request_id: null }),
+    enter(T0 + 0.001, 1, null, "WalletListAllAsyncView.get"),
+    enter(T0 + 0.01, 2, 1, "WalletListAllAsyncView.get.<locals>.<lambda>"),
+    enter(T0 + 0.02, 3, 2, "WalletSerializer.__init__"),
+    ev(T0 + 0.20, "call_exit", { node_id: 3 }),
+    ev(T0 + 0.21, "call_exit", { node_id: 2 }),
+    ev(T0 + 0.22, "call_exit", { node_id: 1 }),
+    ev(T0 + 0.23, "request_end", { status: 200, duration_ms: 230 }),
+  ]);
+}
+
+check("Class.method labels keep the method, not just the class", () => {
+  const h = harness();
+  h.tick(1);
+  drfTree(h);
+  h.tick(0.8);
+  h.clickRow("/api/wallets");   // expand so every frame is drawn
+  h.tick(0.8);
+
+  const drawn = h.drawn();
+  // the method has to survive the fit, or a Django codebase reads as a list
+  // of class names
+  if (!drawn.some((t) => t.indexOf(".get") >= 0))
+    throw new Error("the view's method was truncated away: " + drawn.join(" | "));
+  if (!drawn.some((t) => t.indexOf("__init__") >= 0))
+    throw new Error("the serializer's method was truncated away: " + drawn.join(" | "));
+});
+
+check("three different frames do not render as the same label", () => {
+  const h = harness();
+  h.tick(1);
+  drfTree(h);
+  h.tick(0.8);
+  h.clickRow("/api/wallets");
+  h.tick(0.8);
+
+  // the labels for the three traced frames, whatever they were fitted to
+  const labels = h.drawn().filter((t) => /Wallet/.test(t));
+  const unique = new Set(labels);
+  if (labels.length >= 2 && unique.size < 2)
+    throw new Error("distinct frames collapsed to one label: " + labels.join(" | "));
+});
+
+check("<locals> scoping noise is dropped from a label", () => {
+  const h = harness();
+  h.tick(1);
+  drfTree(h);
+  h.tick(0.8);
+  h.clickRow("/api/wallets");
+  h.tick(0.8);
+  if (h.drawn().some((t) => t.indexOf("<locals>") >= 0))
+    throw new Error("`<locals>` reached a node label; it identifies nothing");
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall chrome tests passed");
 process.exit(failures ? 1 : 0);

@@ -308,3 +308,73 @@ def test_the_snapshot_does_not_pin_a_dropped_detector():
     assert ref() is None, "the dispatch snapshot kept a dead detector alive"
     # and dispatching over a snapshot holding a dead ref is still safe
     bc._dispatch("open", ("/tmp/x", "r", 0))
+
+
+async def test_an_unattributable_blocking_call_is_not_reported(client_for):
+    """A blocking read with no frame of the user's code on the stack.
+
+    Found on a real Django project. Django imports its URLconf lazily, on the
+    first request to arrive; that pulled in reportlab, which reads
+    ~/.reportlab_settings at import time. A genuine blocking read on the loop
+    thread — but charged to a request that merely happened to be first, never
+    repeated, and reported with `qualname=None` because no in-root frame was
+    open. An alarming red chip with nothing actionable behind it.
+
+    `_is_import` cannot catch it: that inspects the PATH being opened, and a
+    dotfile in the home directory looks like ordinary application I/O.
+    """
+    app = FastAPI()
+    probe = os.path.join(tempfile.gettempdir(), "viz_unattributed_probe.txt")
+    with open(probe, "w") as fh:
+        fh.write("x")
+
+    @app.get("/via-library")
+    async def via_library():
+        # Stand-in for library-internal work: the read happens while no frame
+        # of the app's own code is on the stack, which is what an import-time
+        # read inside a third-party package looks like.
+        mon = app.state._viz["monitor"]
+        saved = mon._active
+        mon._active = None  # no in-root frame open
+        try:
+            with open(probe) as fh:
+                fh.read()
+        finally:
+            mon._active = saved
+        return {"ok": True}
+
+    visualize(app, enabled=True, roots=[HERE])
+    collector.clear()
+    async with client_for(app) as client:
+        assert (await client.get("/via-library")).status_code == 200
+
+    calls = [e for e in collector.snapshot() if e.kind == "blocking_call"]
+    assert not calls, (
+        "reported a blocking call it cannot attribute to any frame: "
+        f"{[(e.extra.get('category'), e.extra.get('qualname')) for e in calls]}"
+    )
+
+
+async def test_an_attributable_blocking_call_is_still_reported(client_for):
+    """The guard above must not silence the case the detector exists for."""
+    app = FastAPI()
+    probe = os.path.join(tempfile.gettempdir(), "viz_attributed_probe.txt")
+    with open(probe, "w") as fh:
+        fh.write("x")
+
+    @app.get("/direct")
+    async def direct():
+        with open(probe) as fh:  # inside the app's own frame
+            return {"bytes": len(fh.read())}
+
+    visualize(app, enabled=True, roots=[HERE])
+    collector.clear()
+    async with client_for(app) as client:
+        assert (await client.get("/direct")).status_code == 200
+
+    calls = [e for e in collector.snapshot() if e.kind == "blocking_call"]
+    assert calls, "a blocking read inside the app's own frame went unreported"
+    assert any(e.extra.get("category") == "file" for e in calls)
+    assert any(e.extra.get("qualname") for e in calls), (
+        "reported with no frame — the guard should have suppressed it instead"
+    )

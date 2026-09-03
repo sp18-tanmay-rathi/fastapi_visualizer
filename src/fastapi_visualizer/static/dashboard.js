@@ -1615,6 +1615,37 @@
     return s.length > n ? s.slice(0, n - 1) + "…" : s;
   }
 
+  // Fit a Python qualname into a node box without throwing away the half that
+  // identifies it.
+  //
+  // Plain left-truncation is wrong for qualnames, because Python puts the
+  // distinguishing part LAST. On a Django/DRF project this was measured
+  // rendering three different frames as two identical labels:
+  //
+  //   WalletListAllAsyncView.get                    -> WalletListAllAsy…
+  //   WalletListAllAsyncView.get.<locals>.<lambda>  -> WalletListAllAsy…
+  //   WalletSerializer.__init__                     -> WalletSerializer…
+  //
+  // So the last segment is kept whole and the head is elided instead. It
+  // barely showed on FastAPI, where qualnames are short module-level function
+  // names; it ruins every label in a codebase built from `Class.method`.
+  //
+  // `<locals>` goes too: it is scoping noise that says nothing about which
+  // function this is. The full qualname is still on hover and in the card.
+  function fitQualname(s, n) {
+    if (!s) return "";
+    s = s.replace(/\.<locals>/g, "");
+    if (s.length <= n) return s;
+    var dot = s.lastIndexOf(".");
+    if (dot > 0) {
+      var tail = s.slice(dot); // ".get", ".<lambda>", ".__init__"
+      if (tail.length + 2 <= n) {
+        return s.slice(0, n - tail.length - 1) + "…" + tail;
+      }
+    }
+    return truncate(s, n);
+  }
+
   // Drawing primitives, bound to this canvas once (see viz/primitives.js).
   // Bound rather than passed a ctx at every call, so the ~20 call sites below
   // read exactly as they did before the split.
@@ -1731,7 +1762,7 @@
     ctx.font = Math.max(10, Math.round(T.fs.node * scale)) + "px " + MONO;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    var label = truncate(node.qualname, Math.floor(17 / Math.max(scale, 0.5)));
+    var label = fitQualname(node.qualname, Math.floor(17 / Math.max(scale, 0.5)));
     ctx.fillText(label, x + sw / 2, y);
 
     if (node.state === "suspended") {

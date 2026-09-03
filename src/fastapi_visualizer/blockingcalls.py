@@ -206,6 +206,31 @@ class BlockingCallDetector:
             if trace is None:
                 return  # not inside a request: startup, imports, background work
 
+            # A request is in flight, but is any of the USER's code actually on
+            # the stack? If not, this call belongs to library or framework
+            # internals and cannot be pinned on a frame anyone can change.
+            #
+            # The case that forced this: Django imports its URLconf lazily, on
+            # the first request to arrive. That pulled in reportlab, which
+            # reads ~/.reportlab_settings at import time — a genuine blocking
+            # read on the loop thread, but charged to a request that merely
+            # happened to be first, never repeated, and reported with
+            # `qualname=None` because no in-root frame was open. An alarming
+            # red chip with nothing actionable behind it.
+            #
+            # `_is_import` cannot catch that: it inspects the PATH being
+            # opened, and a dotfile in the home directory looks like ordinary
+            # application I/O. The give-away is the absent frame, not the path.
+            #
+            # Same rule as everywhere else here: report what can be attributed,
+            # and stay quiet about what cannot.
+            if self.monitor is not None:
+                try:
+                    if self.monitor.active_frame() is None:
+                        return
+                except Exception:
+                    pass
+
             category, arg_index = info
             raw = ""
             if arg_index is not None and len(args) > arg_index:

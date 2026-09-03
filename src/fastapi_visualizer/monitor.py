@@ -28,6 +28,7 @@ offload-attribution limitation).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 import os
 import sys
@@ -62,6 +63,10 @@ TOOL_NAME = "fastapi_visualizer"
 CO_COROUTINE = 0x80
 CO_ASYNC_GENERATOR = 0x200
 CO_ASYNC = CO_COROUTINE | CO_ASYNC_GENERATOR
+
+# Set on functions, methods, lambdas and generators; NOT on module or class
+# bodies, which need a real locals dict. See Monitor._is_callable_frame.
+_CO_OPTIMIZED = inspect.CO_OPTIMIZED
 
 _PKG_DIR = str(Path(__file__).resolve().parent)
 
@@ -148,6 +153,29 @@ class Monitor:
         # whole-object assignment instead — atomic under the GIL — so a reader
         # sees one frame's values or None, never a blend. See active_frame().
         self._active: tuple[int, str | None, str] | None = None
+
+    @staticmethod
+    def _is_callable_frame(code) -> bool:
+        """Is this a CALL, or the interpreter building a namespace?
+
+        A module body and a class body are frames, but they are not calls —
+        they run once while Python imports your code. Django imports its
+        URLconf lazily, on the FIRST request to arrive, so every module and
+        class body in the project was charged to that request. Measured on a
+        real project: 100 traced frames (37 of them `<module>`) and 267ms for
+        the first request, against 3 frames and 27ms for the second. The
+        view's own class body was among them, as a node whose qualname is a
+        bare `WalletListAllAsyncView` — which reads exactly like the view
+        "showing only its class name".
+
+        `CO_OPTIMIZED` is the clean split: functions, methods, lambdas and
+        generators have it; module and class bodies do not. DISABLE here is
+        free, because those frames execute once and never again.
+        """
+        try:
+            return bool(code.co_flags & _CO_OPTIMIZED)
+        except Exception:
+            return True  # unsure: trace it rather than lose a real frame
 
     def _in_root(self, filename: str) -> bool:
         if filename.startswith(_PKG_DIR):
@@ -355,6 +383,8 @@ class Monitor:
         try:
             if not self._in_root(code.co_filename):
                 return m.DISABLE
+            if not self._is_callable_frame(code):
+                return m.DISABLE  # module / class body: an import, not a call
         except Exception:
             return m.DISABLE
         try:

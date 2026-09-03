@@ -282,6 +282,34 @@ rather than pretending it's still running.
 
 See `docs/architecture.md` for the full design.
 
+## Other frameworks (experimental)
+
+`visualize()` also attaches to a plain ASGI app — Django, say — and no
+instrumentation changes for it: the tracing core never knew what framework was
+above it. All three blocking detectors work unchanged.
+
+The one difference is that you must **bind the return value**, because there is
+no router to mount into or `.state` to attach to:
+
+```python
+# yourproject/asgi.py
+from django.core.asgi import get_asgi_application
+from fastapi_visualizer import visualize
+
+application = visualize(get_asgi_application(), enabled=True, roots=[BASE_DIR])
+```
+
+`app = visualize(app)` is the form that works everywhere: FastAPI is mutated in
+place and returns itself, so assigning is harmless there and required here.
+`enabled=True` is needed because auto-detection reads `app.debug`, which
+Django's `ASGIHandler` does not have. And it must be ASGI —
+`manage.py runserver` is WSGI, so there is no event loop to look at.
+
+This is a **proof of concept on a branch**, not a supported target. See
+`docs/plans/django-support.md` for what was verified, the one real gap (Django
+uses asgiref's executor, so AnyIO's worker gauge is fed from a fallback), and
+why a separate Django package was rejected.
+
 ## Known limitations
 
 - Only your app's own source is traced; time spent inside stdlib,
